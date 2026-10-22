@@ -1,0 +1,17 @@
+# Local configuration and state
+.env
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build output
+/bin/
+/berth
+web/node_modules/
+web/dist/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

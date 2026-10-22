@@ -1,0 +1,101 @@
+# Berth: Traefik + the Berth backend. Requires Docker Compose >= 2.24.
+#
+#   cp .env.example .env     # optional: every setting has a default
+#   docker compose up -d --build
+#
+# Workspace containers are not defined here: the backend creates them on demand
+# (Milestone 2) and Traefik discovers them through their labels. Their routers
+# reference the ForwardAuth middleware as berth-auth@file.
+name: berth
+
+services:
+  traefik:
+    image: traefik:v3.7 # >= 3.6.1 is required to talk to Docker Engine 29
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=berth-proxy
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --entrypoints.web.address=:80
+      # Workspace URLs never contain these; refusing them at the edge removes a
+      # class of router-vs-checker path confusion. (Path sanitising is already
+      # on by default in Traefik v3.)
+      - --entrypoints.web.http.encodedcharacters.allowencodedslash=false
+      - --entrypoints.web.http.encodedcharacters.allowencodedbackslash=false
+      - --entrypoints.web.http.encodedcharacters.allowencodednullcharacter=false
+      - --entrypoints.web.http.encodedcharacters.allowencodedsemicolon=false
+      # Drop client headers such as X_Forwarded_Uri that alias a header Traefik
+      # manages. Our backends read exact names, but this closes the spoofing
+      # class for whatever sits behind the entrypoint later.
+      - --entrypoints.web.http.aliasheadersstrategy=delete
+      - --entrypoints.traefik.http.aliasheadersstrategy=delete
+      - --ping=true
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+    ports:
+      - "${BERTH_HTTP_PORT:-80}:80"
+    volumes:
+      # Root-equivalent access to the host. Read-only does not limit the Docker
+      # API; it only prevents replacing the socket file.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    networks:
+      - berth-proxy
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  berth:
+    build: .
+    # Not "berth/backend": that Docker Hub namespace belongs to someone else, and a
+    # `docker compose pull` would resolve the name there. Always build locally.
+    image: berth-backend:local
+    pull_policy: build
+    restart: unless-stopped
+    # Optional settings; anything unset falls back to the backend's defaults.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Fixed by the container layout, so they win over anything in .env.
+      BERTH_LISTEN_ADDR: ":8080"
+      BERTH_DB_PATH: /data/berth.db
+    volumes:
+      - berth-state:/data
+    networks:
+      - berth-proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=berth-proxy
+
+      # Public API. /api/auth/check is excluded: only Traefik calls it, directly
+      # over the internal network (middleware berth-auth in traefik/dynamic.yml).
+      - traefik.http.routers.berth-api.entrypoints=web
+      - traefik.http.routers.berth-api.rule=PathPrefix(`/api`) && !Path(`/api/auth/check`)
+      - traefik.http.routers.berth-api.service=berth-api
+      - traefik.http.services.berth-api.loadbalancer.server.port=8080
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  berth-proxy:
+    # Shared by Traefik and the backend only. Workspace containers must not join
+    # it (members of one bridge reach each other, skipping ForwardAuth); they get
+    # private per-user networks instead (CLAUDE.md, "Open decisions" D1).
+    name: berth-proxy
+
+volumes:
+  berth-state:
+    # The backend's SQLite database: every account and session. Distinct from the
+    # per-user berth-data-* volumes, which hold user files and are never deleted.
+    # WARNING: `docker compose down -v` deletes THIS volume (all accounts) but not
+    # the user data volumes, so a re-registered username would meet its old files.
+    name: berth-state

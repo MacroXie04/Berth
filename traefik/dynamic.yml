@@ -1,0 +1,20 @@
+# Traefik dynamic configuration (file provider), mounted read-only into Traefik.
+#
+# The ForwardAuth middleware lives here, not in the backend's container labels:
+# Traefik's Docker provider drops a container that is starting or unhealthy, and
+# a middleware defined on it would vanish with it, turning every workspace route
+# into a 404. Defined here, it always exists, and a dead backend makes the check
+# fail with a 5xx instead. Workspace routers reference it as berth-auth@file.
+http:
+  middlewares:
+    berth-auth:
+      forwardAuth:
+        address: http://berth:8080/api/auth/check
+        # Traefik must fill X-Forwarded-Uri itself; never take it from the client.
+        trustForwardHeader: false
+        # Only the cookie goes to the backend; the original URI travels in
+        # X-Forwarded-Uri.
+        authRequestHeaders:
+          - Cookie
+        # The check replies with a few bytes; refuse to read more than 4 KiB.
+        maxResponseBodySize: 4096
