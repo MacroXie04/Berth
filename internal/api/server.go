@@ -4,6 +4,7 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +22,10 @@ type Deps struct {
 	// Workspaces runs the container lifecycle. Nil means no container backend:
 	// the workspace endpoints answer 503 and everything else still works.
 	Workspaces WorkspaceService
+	// Web serves the single-page app for every GET/HEAD request that no route
+	// claims and that is not under /api, /healthz or /ws (internal/webui.Embedded
+	// in production). Nil means no frontend: those paths answer the JSON 404.
+	Web http.Handler
 
 	SessionTTL        time.Duration
 	CookieSecure      bool
@@ -51,12 +56,11 @@ func (s *Server) Handler() http.Handler {
 	r.Use(s.accessLog)
 	r.Use(s.recoverer)
 
-	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "not found")
-	})
-	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	})
+	// The app is the fallback for a GET/HEAD that no route claimed (see notFound),
+	// so it can never shadow a route: /api, /healthz and the 405s of both behave
+	// as they always did.
+	r.NotFound(s.notFound)
+	r.MethodNotAllowed(methodNotAllowed)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -85,7 +89,41 @@ func (s *Server) Handler() http.Handler {
 			})
 		})
 	})
+
 	return r
+}
+
+func jsonNotFound(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusNotFound, "not found")
+}
+
+func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+// notFound answers a request no route claimed: the single-page app for a
+// GET/HEAD (its client-side routes, assets and index), otherwise the JSON 404.
+func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
+	if s.Web != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && !backendPath(r.URL.Path) {
+		s.Web.ServeHTTP(w, r)
+		return
+	}
+	jsonNotFound(w, r)
+}
+
+// backendPath reports whether p, as the server decoded it, lies in a namespace
+// that is never the app's: /api, /healthz and /ws (Traefik sends an owner's
+// request for a workspace that is not up here, to be answered with a 404). The
+// /api router inherits notFound, so this is also what keeps an unknown
+// /api/... a JSON 404; it covers the spellings the router does not map to those
+// paths either ("/%61pi/me", "/api%2Fme", "//api/me", "/API/me").
+func backendPath(p string) bool {
+	first, _, _ := strings.Cut(strings.TrimLeft(p, "/"), "/")
+	switch strings.ToLower(first) {
+	case "api", "healthz", "ws":
+		return true
+	}
+	return false
 }
 
 // NewHTTPServer returns the production http.Server around h. The API proxies

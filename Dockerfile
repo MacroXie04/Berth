@@ -1,5 +1,18 @@
 # syntax=docker/dockerfile:1
 
+# ---- web --------------------------------------------------------------------
+# The single-page app. web/vite.config.ts writes the build to ../internal/webui/dist,
+# which is /src/internal/webui/dist here: the Go stage embeds it into the binary.
+FROM node:22-alpine AS web
+WORKDIR /src/web
+
+# Dependencies first, so source edits do not invalidate the install layer.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY web ./
+RUN npm run build
+
 # ---- build ------------------------------------------------------------------
 # go.mod's `go` line is only the minimum; build with a release that still gets security fixes.
 FROM golang:1.26-alpine AS build
@@ -12,6 +25,9 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
+# internal/webui embeds dist/ ("//go:embed all:dist"); it must hold the build
+# before `go build` (the repository only tracks a .gitkeep placeholder there).
+COPY --from=web /src/internal/webui/dist ./internal/webui/dist
 RUN go build -trimpath -ldflags="-s -w" -o /out/berth ./cmd/berth
 
 # ---- runtime ----------------------------------------------------------------

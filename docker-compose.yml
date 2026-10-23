@@ -94,6 +94,22 @@ services:
       - traefik.http.routers.berth-api.rule=PathPrefix(`/api`) && !Path(`/api/auth/check`)
       - traefik.http.routers.berth-api.service=berth-api
       - traefik.http.services.berth-api.loadbalancer.server.port=8080
+
+      # The web app (the backend serves the built single-page app): everything
+      # that is not the API, the health probe or a workspace. /healthz stays
+      # unreachable from outside, like /api/auth/check. Priorities are explicit
+      # and distinct so the order never depends on rule length: a workspace
+      # router (priority = its rule length, at least 29) beats the /ws/ catch-all
+      # in traefik/dynamic.yml (priority 2), which beats this one (priority 1).
+      # The exclusions already keep /api, /healthz and /ws out of this router;
+      # the priority is the second lock.
+      - traefik.http.routers.berth-web.entrypoints=web
+      - traefik.http.routers.berth-web.rule=PathPrefix(`/`) && !PathPrefix(`/api`) && !PathPrefix(`/healthz`) && !PathPrefix(`/ws`)
+      - traefik.http.routers.berth-web.priority=1
+      - traefik.http.routers.berth-web.service=berth-api
+      # The script bundle is ~580 kB (160 kB gzipped); only this router compresses.
+      - traefik.http.middlewares.berth-web-compress.compress=true
+      - traefik.http.routers.berth-web.middlewares=berth-web-compress
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 10s

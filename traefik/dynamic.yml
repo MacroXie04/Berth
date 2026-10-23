@@ -22,16 +22,19 @@ http:
   # Catch-all for /ws/. A workspace router exists only while its container is up
   # and healthy; for every other state or name Traefik would answer 404 before any
   # authentication ran, which tells an anonymous caller who has a workspace running
-  # (and when). This router has the lowest priority, so each per-user router (a
-  # longer rule) still wins when it exists; otherwise the request goes through the
-  # same check: no session gets 401, someone else's path gets 403, and only the
-  # owner reaches the backend, which answers 404.
+  # (and when). Its priority is explicit and low, so each per-user router (the
+  # Docker provider's default priority is the rule length, at least 29) still wins
+  # when it exists; otherwise the request goes through the same check: no
+  # session gets 401, someone else's path gets 403, and only the owner reaches the
+  # backend, which answers 404. The web app router (docker-compose.yml,
+  # berth-web) has priority 1 and excludes /ws itself: this one must stay above
+  # it, so a /ws/ path can never fall through to the app without a check.
   routers:
     berth-ws-fallback:
       entryPoints:
         - web
       rule: PathPrefix(`/ws/`)
-      priority: 1
+      priority: 2
       middlewares:
         - berth-auth
       service: berth-ws-fallback

@@ -10,6 +10,10 @@
 /berth
 web/node_modules/
 web/dist/
+# Vite writes the production build here; the Go binary embeds it. Only the
+# placeholder is tracked, so a fresh clone still compiles.
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep
 
 # Editors and OS
 .idea/

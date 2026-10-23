@@ -17,6 +17,7 @@ import (
 	"github.com/MacroXie04/Berth/internal/config"
 	"github.com/MacroXie04/Berth/internal/docker"
 	"github.com/MacroXie04/Berth/internal/store"
+	"github.com/MacroXie04/Berth/internal/webui"
 	"github.com/MacroXie04/Berth/internal/workspace"
 )
 
@@ -83,8 +84,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if cfg.PublicIP == "" {
+		log.Warn("BERTH_PUBLIC_IP is not set: workspace video (WebRTC) only connects for browsers that can reach " +
+			"the Docker bridge network, i.e. the Docker host itself. Set it to the address browsers use to reach this " +
+			"host (its LAN address on a LAN, its public address on the internet).")
+	}
 	go keepProxyAttached(ctx, workspaces, log, cfg.ProxyAttachInterval)
 
+	web, err := webui.Embedded()
+	if err != nil {
+		return err
+	}
 	srv := api.New(api.Deps{
 		Store:             st,
 		Hasher:            hasher,
@@ -94,6 +104,7 @@ func run() error {
 		DefaultMemLimitMB: cfg.DefaultMemLimitMB,
 		DefaultCPULimit:   cfg.DefaultCPULimit,
 		Workspaces:        workspaces,
+		Web:               web,
 	})
 	// The slowest handlers are a workspace start (bounded by StartTimeout) and a
 	// stop (graceful timeout plus slack); leave headroom after both.

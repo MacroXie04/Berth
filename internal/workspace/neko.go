@@ -12,6 +12,7 @@ const (
 	envNekoUserPassword  = "NEKO_MEMBER_MULTIUSER_USER_PASSWORD"
 	envNekoAdminPassword = "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD"
 	envNekoEPR           = "NEKO_WEBRTC_EPR"
+	envNekoUDPMux        = "NEKO_WEBRTC_UDPMUX"
 	envNekoNAT1TO1       = "NEKO_WEBRTC_NAT1TO1"
 	envNekoPathPrefix    = "NEKO_SERVER_PATH_PREFIX"
 	envNekoProxy         = "NEKO_SERVER_PROXY"
@@ -40,7 +41,15 @@ func nekoEnv(cfg Config, username, userPassword, adminPassword string, udpStart,
 		// Otherwise <prefix>/metrics answers for any logged-in Berth user (verified).
 		envNekoMetrics + "=false",
 	}
-	if udpStart > 0 {
+	switch {
+	case udpStart > 0 && udpEnd == udpStart:
+		// One port: neko multiplexes every viewer of the workspace over it. This is
+		// the default; it publishes one port per workspace and avoids the per-viewer
+		// sockets a range uses (a closed tab holds its socket for 5-10 s, and sockets
+		// were seen to stay bound until neko restarted).
+		env = append(env, envNekoUDPMux+"="+itoa(udpStart))
+	case udpStart > 0:
+		// A range: each viewer takes one port from it.
 		env = append(env, fmt.Sprintf("%s=%d-%d", envNekoEPR, udpStart, udpEnd))
 	}
 	if cfg.PublicIP != "" {

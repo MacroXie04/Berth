@@ -93,7 +93,7 @@ func Load(getenv func(string) string) (Config, error) {
 		TraefikEntrypoint:    l.str("BERTH_TRAEFIK_ENTRYPOINT", "web"),
 		UDPPortMin:           l.integer("BERTH_UDP_PORT_MIN", 30000),
 		UDPPortMax:           l.integer("BERTH_UDP_PORT_MAX", 30999),
-		UDPPortsPerWorkspace: l.integer("BERTH_UDP_PORTS_PER_WORKSPACE", 8),
+		UDPPortsPerWorkspace: l.integer("BERTH_UDP_PORTS_PER_WORKSPACE", 1),
 		Resolution:           l.str("BERTH_RESOLUTION", "1280x720@30"),
 		PublicIP:             l.str("BERTH_PUBLIC_IP", ""),
 		ShmSizeMB:            l.integer("BERTH_SHM_MB", 2048),

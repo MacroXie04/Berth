@@ -146,7 +146,29 @@ func TestNekoEnv(t *testing.T) {
 	if v := envValue(nekoEnv(cfg, "alice", "u", "a", 0, 0), envNekoNAT1TO1); v != "" {
 		t.Errorf("NAT1TO1 set without a public IP: %q", v)
 	}
-	if v := envValue(nekoEnv(cfg, "alice", "u", "a", 0, 0), envNekoEPR); v != "" {
-		t.Errorf("EPR set without a port block: %q", v)
+	for _, key := range []string{envNekoEPR, envNekoUDPMux} {
+		if v := envValue(nekoEnv(cfg, "alice", "u", "a", 0, 0), key); v != "" {
+			t.Errorf("%s set without a port block: %q", key, v)
+		}
+	}
+}
+
+// One port per workspace (the default) is multiplexed over, not a one-port range.
+func TestNekoEnvOnePortUsesTheMultiplexer(t *testing.T) {
+	cfg := testConfig()
+	env := nekoEnv(cfg, "alice", "u", "a", 30005, 30005)
+	if v := envValue(env, envNekoUDPMux); v != "30005" {
+		t.Errorf("UDPMUX = %q, want 30005", v)
+	}
+	if v := envValue(env, envNekoEPR); v != "" {
+		t.Errorf("EPR = %q; a single port must use the multiplexer, not a range", v)
+	}
+	// Two ports or more: a range, no multiplexer.
+	env = nekoEnv(cfg, "alice", "u", "a", 30005, 30006)
+	if v := envValue(env, envNekoEPR); v != "30005-30006" {
+		t.Errorf("EPR = %q, want 30005-30006", v)
+	}
+	if v := envValue(env, envNekoUDPMux); v != "" {
+		t.Errorf("UDPMUX = %q for a range", v)
 	}
 }
