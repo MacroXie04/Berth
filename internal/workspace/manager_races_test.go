@@ -452,8 +452,14 @@ func TestRollbackSurvivesTheRequestContextBeingCancelled(t *testing.T) {
 func TestStartIsBoundedByStartTimeout(t *testing.T) {
 	r := newRig(t, func(c *Config) { c.StartTimeout = 50 * time.Millisecond })
 	u := r.user("alice")
-	// A daemon that hangs until the deadline, then answers.
-	r.dock.SetHook("EnsureNetwork", func(c context.Context) { <-c.Done() })
+	// A daemon that hangs until the deadline (or, if the code under test sets
+	// none, for three seconds), then answers.
+	r.dock.SetHook("EnsureNetwork", func(c context.Context) {
+		select {
+		case <-c.Done():
+		case <-time.After(3 * time.Second):
+		}
+	})
 	start := time.Now()
 	_, err := r.m.Start(ctx, u)
 	if !errors.Is(err, context.DeadlineExceeded) {
