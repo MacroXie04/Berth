@@ -799,6 +799,45 @@ func TestAnObservationInsideItsWriteCannotLandOnALaterClaim(t *testing.T) {
 	}
 }
 
+// The same for an observation of "the container is gone".
+func TestAGoneObservationInsideItsWriteCannotLandOnALaterClaim(t *testing.T) {
+	r := newRig(t)
+	hs := newHoldingStore(r.st, store.StateOffline)
+	r.withStore(hs)
+	u := r.user("alice")
+	x := r.mustStartContainer(u)
+	r.dock.Vanish(x)
+
+	hs.armed.Store(true)
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Status(ctx, u); done <- err }()
+	<-hs.reached // this Status is about to write starting -> offline (and free the ports)
+
+	// Another poll applies the same fact, and the user powers on again.
+	if s, err := r.m.Status(ctx, u); err != nil || s.Workspace.State != store.StateOffline {
+		t.Fatalf("second Status = %v, %v", s.Workspace.State, err)
+	}
+	inCreate := newGate(r.dock, "CreateContainer")
+	second := r.startAsync(u)
+	<-inCreate.reached // the row is a fresh claim: starting, no container, a new block
+
+	close(hs.release) // the stale "gone" now reaches the database
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	claim := r.ws(u)
+	if claim.State != store.StateStarting || claim.ContainerID != "" || claim.UDPPortStart == 0 {
+		t.Fatalf("row = %+v; the stale observation landed on the new claim", claim)
+	}
+	close(inCreate.release)
+	if res := <-second; res.err != nil {
+		t.Fatalf("the second start failed: %v", res.err)
+	}
+	if ws := r.ws(u); ws.State != store.StateStarting || ws.ContainerID == "" || ws.UDPPortStart != claim.UDPPortStart {
+		t.Fatalf("row after the second start: %+v", ws)
+	}
+}
+
 func (r *rig) mustStartContainer(u store.User) string {
 	r.t.Helper()
 	r.mustStart(u)

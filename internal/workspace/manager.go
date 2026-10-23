@@ -400,7 +400,7 @@ func (m *Manager) rollback(user store.User, createdID string) {
 		// Nothing recorded survives. A create whose reply was lost can still have
 		// left a container of this attempt behind: find it by name.
 		event, opts = EventGone, []store.TransitionOption{store.ClearContainer()}
-		if createdGone && m.sweepOrphan(ctx, user) {
+		if m.sweepOrphan(ctx, user) {
 			opts = append(opts, store.ReleaseUDPRange())
 		}
 	}
@@ -436,7 +436,7 @@ func (m *Manager) recoverClaimed(ctx context.Context, user store.User) error {
 		return nil
 	}
 	m.log.Warn("recovering a workspace that has no container", "user", user.Username, "state", ws.State)
-	opts := []store.TransitionOption{store.ClearContainer(), store.OnlyIfContainer("")}
+	opts := []store.TransitionOption{store.ClearContainer()}
 	if m.sweepOrphan(ctx, user) {
 		opts = append(opts, store.ReleaseUDPRange())
 	}
