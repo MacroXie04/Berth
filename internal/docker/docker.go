@@ -102,7 +102,9 @@ type Client interface {
 	// ManagedNetworks lists the names of the networks Berth created.
 	ManagedNetworks(ctx context.Context) ([]string, error)
 	// ConnectToNetwork attaches an existing container to a network unless it is
-	// already attached. ErrNotFound if the container or network is missing.
+	// already attached. The attachment never becomes the container's default
+	// gateway (it would move the container's published ports and reset live
+	// connections). ErrNotFound if the container or network is missing.
 	ConnectToNetwork(ctx context.Context, network, container string) error
 	// EnsureVolume creates a named volume unless it already exists.
 	EnsureVolume(ctx context.Context, name string, labels map[string]string) error

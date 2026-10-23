@@ -291,3 +291,49 @@ func TestMobyPublishesTheUDPRangeIdentically(t *testing.T) {
 		}
 	}
 }
+
+// Attaching a side network must not change which network is the container's
+// default gateway. Docker picks it by network name unless told otherwise, and
+// when it flips, the container's published host ports are re-created on the new
+// network: a plain `docker network connect` of Traefik to berth-net-<user> reset
+// every connection through Traefik (measured: 4 of 400 polled requests failed
+// during the connect; with a lower gateway priority none did).
+func TestConnectToNetworkKeepsDefaultGateway(t *testing.T) {
+	m, ctx := newMoby(t)
+	// "anet" sorts before "znet": the case that flips the gateway without a priority.
+	home, side := uniq(t, "znet"), uniq(t, "anet")
+	name := uniq(t, "ctr")
+	t.Cleanup(func() {
+		bg := context.Background()
+		m.RemoveContainer(bg, name)
+		m.c.NetworkRemove(bg, home, client.NetworkRemoveOptions{})
+		m.c.NetworkRemove(bg, side, client.NetworkRemoveOptions{})
+	})
+	labels := map[string]string{LabelManaged: "true"}
+	for _, n := range []string{home, side} {
+		if err := m.EnsureNetwork(ctx, n, labels); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id, err := m.CreateContainer(ctx, ContainerSpec{Name: name, Image: testImage(), Network: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.StartContainer(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConnectToNetwork(ctx, side, name); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := m.c.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := raw.Container.NetworkSettings.Networks
+	if ep := nets[side]; ep == nil || ep.GwPriority >= 0 {
+		t.Errorf("side network endpoint %+v: its gateway priority must be below the home network's (0)", ep)
+	}
+	if ep := nets[home]; ep == nil || ep.GwPriority != 0 {
+		t.Errorf("home network endpoint %+v: gateway priority must stay 0", ep)
+	}
+}

@@ -106,7 +106,16 @@ func (m *Moby) ConnectToNetwork(ctx context.Context, networkName, containerName 
 	if ok, err := attached(); err != nil || ok {
 		return err
 	}
-	if _, err := m.c.NetworkConnect(ctx, networkName, client.NetworkConnectOptions{Container: id}); err != nil {
+	// GwPriority -1: this is a side attachment, so it must never become the
+	// container's default gateway. By default Docker picks the gateway by network
+	// name, and Traefik joining berth-net-<user> (which sorts before berth-proxy)
+	// would move its published host port to that network: every connection through
+	// Traefik, including the request that triggered the attach, is reset.
+	opts := client.NetworkConnectOptions{
+		Container:      id,
+		EndpointConfig: &network.EndpointSettings{GwPriority: -1},
+	}
+	if _, err := m.c.NetworkConnect(ctx, networkName, opts); err != nil {
 		// Lost a race with another attach? Then it is fine.
 		if ok, aerr := attached(); aerr == nil && ok {
 			return nil
