@@ -108,11 +108,11 @@ func (f *flights) end(id int64) {
 }
 
 // mark is taken before an observation reads anything: the epoch to compare
-// later, and whether an operation owns the workspace right now.
-func (f *flights) mark(id int64) (epoch uint64, busy bool) {
+// with unchanged later.
+func (f *flights) mark(id int64) uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.epoch[id], f.active[id] != ""
+	return f.epoch[id]
 }
 
 // unchanged reports that no operation began or is running since mark, so what
@@ -492,19 +492,17 @@ func (m *Manager) stopClaimed(ctx context.Context, user store.User) error {
 // it is running. Errors from Docker are returned only when they leave the
 // database state unknowable; a failed stats sample just omits the numbers.
 //
-// While a start, stop or recovery owns the workspace, or if one began during the
-// observation, Status reports the database row and changes nothing: a container
-// that is merely not running yet is not a crash.
+// If a start, stop or recovery owns the workspace, or began or ended while Status
+// was looking, Status changes nothing and reports what it saw: a container that
+// is merely not running yet is not a crash, and an answer from before the
+// operation says nothing about the container it left behind.
 func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
-	epoch, busy := m.flight.mark(user.ID)
+	epoch := m.flight.mark(user.ID)
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
 		return Status{}, err
 	}
 	st := Status{Workspace: ws}
-	if busy {
-		return st, nil
-	}
 	if ws.State == store.StateStarting && ws.ContainerID == "" {
 		// Nothing is starting it (it would hold the claim): abandoned.
 		if err := m.recoverAbandoned(ctx, user); err != nil {
