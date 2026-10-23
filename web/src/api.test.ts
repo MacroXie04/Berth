@@ -94,6 +94,27 @@ describe('responses', () => {
     expect(s.neko_password).toBe('pw')
   })
 
+  it('carries the account the server answered for (top-level "username") on status, start and stop', async () => {
+    const { api } = client(() => respond(200, { username: 'bob', workspace: status }))
+    expect((await api.workspace()).username).toBe('bob')
+    expect((await api.start()).username).toBe('bob')
+    expect((await api.stop()).username).toBe('bob')
+  })
+
+  it('has no username when an older backend does not send one (or sends nonsense)', async () => {
+    const old = client(() => respond(200, { workspace: status }))
+    expect((await old.api.workspace()).username).toBeUndefined()
+    for (const username of [7, null, '', ['bob'], { name: 'bob' }]) {
+      const odd = client(() => respond(200, { username, workspace: status }))
+      expect((await odd.api.workspace()).username, JSON.stringify(username)).toBeUndefined()
+    }
+  })
+
+  it('does not take a username from inside the workspace object', async () => {
+    const { api } = client(() => respond(200, { workspace: { ...status, username: 'bob' } }))
+    expect((await api.workspace()).username).toBeUndefined()
+  })
+
   it('tolerates a status without usage or neko password', async () => {
     const { api } = client(() =>
       respond(200, {

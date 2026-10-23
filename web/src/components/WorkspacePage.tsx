@@ -2,7 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { ApiError, type Api } from '../api'
 import { formatElapsed } from '../format'
 import { useWorkspace } from '../useWorkspace'
-import { SLOW_START_SECONDS, announcement, canPowerOn, elapsedSeconds, isUnhealthy, viewFor } from '../workspaceView'
+import {
+  SLOW_START_SECONDS,
+  announcement,
+  canPowerOn,
+  ctaCopy,
+  elapsedSeconds,
+  isUnhealthy,
+  viewFor,
+} from '../workspaceView'
 import { BrowserPane } from './BrowserPane'
 import { SplitView } from './SplitView'
 import { StatusBar } from './StatusBar'
@@ -14,6 +22,11 @@ interface Props {
   username: string
   /** Called after a successful logout. */
   onLoggedOut(): void
+  /**
+   * The server answered for another account than `username` (another tab of
+   * this browser logged in as someone else): start over from /api/me.
+   */
+  onIdentityChanged(): void
 }
 
 /** Seconds since `active` last became true; 0 while inactive. */
@@ -36,14 +49,17 @@ function useElapsed(active: boolean): number {
   return since === null ? 0 : elapsedSeconds(since, now)
 }
 
-export function WorkspacePage({ api, username, onLoggedOut }: Props) {
-  const ws = useWorkspace(api)
+export function WorkspacePage({ api, username, onLoggedOut, onIdentityChanged }: Props) {
+  const ws = useWorkspace(api, { username, onMismatch: onIdentityChanged })
   const { status, busy } = ws
   const [logoutError, setLogoutError] = useState<string | null>(null)
 
   const view = viewFor(status, busy)
+  const cta = status ? ctaCopy(status) : null
   const elapsed = useElapsed(view === 'starting')
   const powerOnRef = useRef<HTMLButtonElement>(null)
+  // Shift+Esc in the terminal lands here: from the divider Tab reaches the browser pane and Shift+Tab the terminal again.
+  const dividerRef = useRef<HTMLDivElement>(null)
 
   // After a power-off the call to action takes over; put keyboard focus there.
   const prevView = useRef(view)
@@ -99,17 +115,10 @@ export function WorkspacePage({ api, username, onLoggedOut }: Props) {
           </div>
         )}
 
-        {view === 'cta' && status && (
+        {view === 'cta' && cta && (
           <div className="card">
-            <h2 className="card__title">
-              {status.state === 'stopped' ? 'Your workspace is powered off' : 'Your workspace is not running'}
-            </h2>
-            <p className="card__text">
-              {status.state === 'stopped'
-                ? 'It was stopped, by you or after sitting idle. Powering on starts it again in a few seconds.'
-                : 'Its container was removed after a long time without use. Powering on creates a fresh one, which can take a little longer.'}{' '}
-              Your files are kept: everything in your home directory is there when it comes back.
-            </p>
+            <h2 className="card__title">{cta.title}</h2>
+            <p className="card__text">{cta.text}</p>
             <button
               type="button"
               className="btn btn--primary btn--large"
@@ -151,7 +160,8 @@ export function WorkspacePage({ api, username, onLoggedOut }: Props) {
         {view === 'panes' && status && (
           <SplitView
             label="Resize the terminal and browser panes"
-            first={<TerminalPane username={username} />}
+            dividerRef={dividerRef}
+            first={<TerminalPane username={username} onLeave={() => dividerRef.current?.focus()} />}
             second={<BrowserPane username={username} nekoPassword={status.neko_password} />}
           />
         )}

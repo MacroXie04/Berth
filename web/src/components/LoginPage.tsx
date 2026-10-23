@@ -19,7 +19,16 @@ interface Props {
   onLoggedIn(user: User): void
 }
 
-/** Login and registration in one form. Registering does not log in: it creates the account, then logs in. */
+/**
+ * Login and registration in one form. Registering does not log in: it creates
+ * the account, then logs in.
+ *
+ * While a request is under way the inputs stay ENABLED but read-only (and
+ * aria-busy): a disabled input cannot take focus, and the page moves focus to
+ * the field that needs attention (password after a failed login, username
+ * after "taken") before the request has finished and the form is released.
+ * Only the submit button is disabled.
+ */
 export function LoginPage({ api, notice, onLoggedIn }: Props) {
   const [mode, setMode] = useState<Mode>('login')
   const [username, setUsername] = useState('')
@@ -187,7 +196,8 @@ export function LoginPage({ api, notice, onLoggedIn }: Props) {
                 required
                 aria-invalid={uMessage ? true : undefined}
                 aria-describedby={register ? `${ids.uh}${uMessage ? ` ${ids.uh}-err` : ''}` : undefined}
-                disabled={busy}
+                readOnly={busy}
+                aria-busy={busy || undefined}
               />
               {register && (
                 <p id={ids.uh} className="field__hint">
@@ -215,7 +225,8 @@ export function LoginPage({ api, notice, onLoggedIn }: Props) {
                 required
                 aria-invalid={pProblem ? true : undefined}
                 aria-describedby={register ? `${ids.ph}${pProblem ? ` ${ids.ph}-err` : ''}` : undefined}
-                disabled={busy}
+                readOnly={busy}
+                aria-busy={busy || undefined}
               />
               {register && (
                 <p id={ids.ph} className="field__hint">

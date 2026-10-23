@@ -8,7 +8,14 @@ import { WorkspacePage } from './WorkspacePage'
 // xterm.js needs a real layout engine; the terminal is covered by the ttyd tests
 // and the browser smoke test.
 vi.mock('./TerminalPane', () => ({
-  TerminalPane: ({ username }: { username: string }) => <div data-testid="terminal" data-user={username} />,
+  // The real pane calls onLeave on Shift+Escape; the button stands in for that key.
+  TerminalPane: ({ username, onLeave }: { username: string; onLeave?: () => void }) => (
+    <div data-testid="terminal" data-user={username}>
+      <button type="button" onClick={onLeave}>
+        leave terminal
+      </button>
+    </div>
+  ),
 }))
 
 const NEKO_PW = 'neko-secret-pw'
@@ -48,13 +55,15 @@ function mockApi(initial: WorkspaceStatus) {
   return { ...m, api: m as unknown as Api }
 }
 
-async function renderPage(initial: WorkspaceStatus, onLoggedOut = vi.fn()) {
+async function renderPage(initial: WorkspaceStatus, onLoggedOut = vi.fn(), onIdentityChanged = vi.fn()) {
   const m = mockApi(initial)
-  const utils = render(<WorkspacePage api={m.api} username="alice" onLoggedOut={onLoggedOut} />)
+  const utils = render(
+    <WorkspacePage api={m.api} username="alice" onLoggedOut={onLoggedOut} onIdentityChanged={onIdentityChanged} />,
+  )
   await act(async () => {
     await vi.advanceTimersByTimeAsync(0)
   })
-  return { ...m, ...utils, onLoggedOut }
+  return { ...m, ...utils, onLoggedOut, onIdentityChanged }
 }
 
 async function advance(ms: number) {
@@ -74,25 +83,54 @@ afterEach(() => {
 describe('state to UI', () => {
   it('shows the first answer as "checking" until it arrives', () => {
     const m = mockApi(ws('offline'))
-    render(<WorkspacePage api={m.api} username="alice" onLoggedOut={() => {}} />)
+    render(<WorkspacePage api={m.api} username="alice" onLoggedOut={() => {}} onIdentityChanged={() => {}} />)
     expect(screen.getByText('Checking your workspace…')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Power on' })).toBeNull()
   })
 
   it.each([
-    ['offline', /not running/i, /removed/i],
-    ['stopped', /powered off/i, /it was stopped/i],
-  ] as const)('%s: a clear call to action and a promise that data is kept', async (state, title, text) => {
-    await renderPage(ws(state))
+    ['offline', ws('offline'), /not running/i, /has not been started yet/i, /your files are kept from then on/i],
+    [
+      'offline after a stop (last_stopped_at set)',
+      ws('offline', 'none', { last_stopped_at: '2026-05-01 10:00:00' }),
+      /not running/i,
+      /no running container right now/i,
+      /everything in your home directory is kept/i,
+    ],
+    [
+      'offline after use (only last_active_at set)',
+      ws('offline', 'none', { last_active_at: '2026-05-01 10:00:00' }),
+      /not running/i,
+      /no running container right now/i,
+      /everything in your home directory is kept/i,
+    ],
+    [
+      'stopped',
+      ws('stopped'),
+      /powered off/i,
+      /it was stopped/i,
+      /everything in your home directory is there when it comes back/i,
+    ],
+  ] as const)('%s: a clear call to action and a promise that data is kept', async (_name, status, title, text, kept) => {
+    await renderPage(status)
     expect(screen.getByRole('heading', { name: title })).toBeInTheDocument()
-    expect(screen.getByText(text)).toBeInTheDocument()
-    expect(screen.getByText(/your files are kept/i)).toBeInTheDocument()
+    const card = screen.getByRole('heading', { name: title }).parentElement!
+    expect(within(card).getByText(text)).toBeInTheDocument()
+    expect(within(card).getByText(kept)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Power on' })).toBeEnabled()
     expect(screen.queryByTestId('terminal')).toBeNull()
     expect(screen.queryByTitle('Remote browser')).toBeNull()
     expect(
-      within(screen.getByRole('banner')).getByText(state === 'offline' ? 'Offline' : 'Stopped'),
+      within(screen.getByRole('banner')).getByText(status.state === 'offline' ? 'Offline' : 'Stopped'),
     ).toBeInTheDocument()
+  })
+
+  it('never claims that a container was removed after a long time (that is not what offline means)', async () => {
+    for (const status of [ws('offline'), ws('offline', 'none', { last_stopped_at: '2026-05-01 10:00:00' })]) {
+      const { unmount } = await renderPage(status)
+      expect(document.body.textContent).not.toMatch(/removed/i)
+      unmount()
+    }
   })
 
   it('starting: progress with elapsed seconds, no panes, polls until running', async () => {
@@ -315,9 +353,74 @@ describe('Power off', () => {
     expect(screen.getByTestId('terminal')).toBeInTheDocument()
   })
 
+  it('the question goes away when a poll reports that the workspace stopped meanwhile (the reaper), instead of offering to power off a stopped workspace', async () => {
+    const m = await renderPage(running())
+    fireEvent.click(screen.getByRole('button', { name: 'Power off' }))
+    expect(screen.getByRole('group', { name: /confirm power off/i })).toBeInTheDocument()
+    m.set(ws('stopped'))
+    await advance(10_000) // the next poll
+    expect(screen.queryByRole('group', { name: /confirm power off/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /yes, power off/i })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Power off' })).toBeDisabled()
+    expect(m.stop).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Power on' })).toBeInTheDocument()
+  })
+
   it('is disabled when there is nothing to power off', async () => {
     await renderPage(ws('stopped'))
     expect(screen.getByRole('button', { name: 'Power off' })).toBeDisabled()
+  })
+})
+
+describe('leaving the terminal from the keyboard', () => {
+  it('the terminal pane can put focus on the pane divider (Shift+Esc), from where Tab continues to the browser pane', async () => {
+    await renderPage(running())
+    expect(screen.getByRole('separator')).not.toHaveFocus()
+    fireEvent.click(screen.getByRole('button', { name: 'leave terminal' }))
+    expect(screen.getByRole('separator')).toHaveFocus()
+  })
+})
+
+describe('another account in another tab (the cookie is shared by all tabs)', () => {
+  it('an answer for someone else mounts no panes, sends no heartbeat, and starts over', async () => {
+    const m = await renderPage(running({ username: 'bob' }))
+    expect(m.onIdentityChanged).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('terminal')).toBeNull()
+    expect(screen.queryByTitle('Remote browser')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Power on' })).toBeNull()
+    await advance(60_000)
+    expect(m.heartbeat).not.toHaveBeenCalled()
+    expect(m.workspace).toHaveBeenCalledTimes(1) // and it does not keep asking
+  })
+
+  it('panes that are up are torn down when a later poll answers for someone else', async () => {
+    const m = await renderPage(running({ username: 'alice' }))
+    expect(screen.getByTestId('terminal')).toBeInTheDocument()
+    expect(m.onIdentityChanged).not.toHaveBeenCalled()
+    const beats = m.heartbeat.mock.calls.length
+    m.set(running({ username: 'bob' }))
+    await advance(10_000)
+    expect(m.onIdentityChanged).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('terminal')).toBeNull()
+    expect(screen.queryByTitle('Remote browser')).toBeNull()
+    await advance(60_000)
+    expect(m.heartbeat).toHaveBeenCalledTimes(beats)
+  })
+
+  it('Power on is not acted on when the answer is for someone else', async () => {
+    const m = await renderPage(ws('stopped', 'none', { username: 'alice' }))
+    m.start.mockResolvedValue(ws('starting', 'none', { username: 'bob' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Power on' }))
+    await advance(0)
+    expect(m.onIdentityChanged).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTitle('Remote browser')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /starting/i })).toBeNull()
+  })
+
+  it('an answer without a username (an older backend) is taken as it is', async () => {
+    const m = await renderPage(running())
+    expect(m.onIdentityChanged).not.toHaveBeenCalled()
+    expect(screen.getByTestId('terminal')).toBeInTheDocument()
   })
 })
 

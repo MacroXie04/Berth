@@ -20,7 +20,7 @@ supervisord/Chromium config and **fails the build** if that config no longer has
 | What | How |
 |---|---|
 | Processes | `supervisord` (root, PID 1 under `--init`) starts neko's programs (`x-server`, `pulseaudio`, `openbox`, `chromium`, `neko`) and ours (`ttyd`) as `user`; every program has `autorestart=true` |
-| ttyd | `/usr/bin/ttyd` (distro package), port **7681**, `--writable --check-origin`, no base path, cwd `/home/user`, runs `/bin/bash -l`; config `rootfs/etc/neko/supervisord/ttyd.conf` |
+| ttyd | `/usr/bin/ttyd` (distro package), port **7681**, `--writable --check-origin --ping-interval 30`, no base path, cwd `/home/user`, runs `/bin/bash -l`; config `rootfs/etc/neko/supervisord/ttyd.conf` |
 | neko | port **8080**, serves under `NEKO_SERVER_PATH_PREFIX` (set per user at runtime) |
 | Chromium | neko's own flags (incl. `--no-sandbox`), profile `--user-data-dir=/home/user/.config/chromium` |
 | Tools | git curl wget vim nano tmux htop jq less unzip openssh-client procps iputils-ping ca-certificates python3 bash-completion |
@@ -45,6 +45,14 @@ Flags this image was tested with (nothing else is needed): `--memory 2g --cpus 2
   neko must **not** be stripped: it serves everything under its own prefix.
 * **Load the browser at `/ws/<user>/browser/` with the trailing slash.** neko answers the slash-less URL too, but its
   `index.html` uses relative asset URLs (`./assets/...`), which then resolve to `/ws/<user>/assets/...` and 404.
+* **ttyd ignores PAUSE and hangs up on slow pingers.** ttyd 1.7.7 does not honour the client's flow-control PAUSE (6 MB
+  of output arrived within 1 s after a PAUSE) and closes a client that has not answered a ping within twice the ping
+  interval (10 s at the default 5 s). A page that is busy rendering a flood of output therefore lost its shell
+  (the client reconnects into a new one); `--ping-interval 30` in `ttyd.conf` stretches that to 60 s.
+* **A closed terminal can leave a `bash -l` behind.** If the socket closes while bash waits at readline's
+  "Display all N possibilities? (y or n)" prompt, bash ignores the SIGHUP ttyd sends and keeps running (ttyd logs
+  `killing process` but never `process killed with signal 1`) until the container stops. Closing at an idle prompt, after
+  `echo hi`, or after clearing the line with Ctrl-U ended the shell as expected. CLAUDE.md, decision D12.
 * **ttyd `--check-origin`** rejects a WebSocket upgrade whose `Origin` host differs from `Host`, and also one with
   no `Origin` at all (non-browser clients must send `Origin` equal to `Host`). Traefik keeps `Host`, so browsers work.
 * **neko login without a second prompt**: the neko client (3.2.0) auto-logs in from `?usr=<name>&pwd=<password>` and
@@ -66,11 +74,14 @@ Names come from `neko serve --help` of the image (`NEKO_` + flag name, upper cas
 | `NEKO_MEMBER_MULTIUSER_USER_PASSWORD` | random secret | **required**: the default is `neko`. Role: regular user |
 | `NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD` | another random secret | **required**: the default is `admin`. Role: admin |
 | `NEKO_DESKTOP_SCREEN` | `1280x720@30` | already neko's default; verified through `GET api/room/screen` |
-| `NEKO_WEBRTC_EPR` | e.g. `52000-52007` | must equal the published range (`-p 52000-52007:52000-52007/udp`, identity mapping) |
+| `NEKO_WEBRTC_UDPMUX` | e.g. `30000` | **Berth's default** (`BERTH_UDP_PORTS_PER_WORKSPACE=1`, a block of one port): one UDP socket serves every viewer of the workspace. Must equal the published port (`-p 30000:30000/udp`, identity mapping). Berth sets this **instead of** `NEKO_WEBRTC_EPR` whenever the workspace's recorded block is a single port |
+| `NEKO_WEBRTC_EPR` | e.g. `52000-52007` | each viewer takes one port of the range. Berth sets this **instead of** `NEKO_WEBRTC_UDPMUX` whenever the recorded block has two or more ports (`BERTH_UDP_PORTS_PER_WORKSPACE` above 1, or a workspace created while the default was 8: a block keeps its size). Must equal the published range (`-p 52000-52007:52000-52007/udp`, identity mapping) |
 | `NEKO_WEBRTC_NAT1TO1` | the host's public IP | address put into the ICE candidates |
 | `NEKO_SERVER_PROXY` | `true` | trust Traefik's `X-Forwarded-*` |
 | `NEKO_SESSION_IMPLICIT_HOSTING` | `true` | the single user gets control on first click (verified in neko's `system/init` settings) |
 | `NEKO_SERVER_METRICS` | `false` | otherwise `<prefix>/metrics` answers for any logged-in Berth user (verified: 404 when false) |
+
+Berth never sets both of these: the manager records a UDP block before it creates the container, and the block's size decides which one is set.
 
 Do **not** use the v2 names (`NEKO_EPR`, `NEKO_NAT1TO1`, `NEKO_PASSWORD`, `NEKO_PASSWORD_ADMIN`, `NEKO_SCREEN`,
 `NEKO_PATH_PREFIX`, ...). They still parse but neko logs `ERR deprecated V2 configuration is in use`, and upstream

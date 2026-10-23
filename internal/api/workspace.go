@@ -42,6 +42,20 @@ type statusJSON struct {
 	NekoPassword string `json:"neko_password,omitempty"`
 }
 
+// workspaceResponse is the body of every workspace endpoint that reports a
+// status. It names the account the answer is about: the session cookie is shared
+// by every tab of a browser, so a page that remembers who it believes is logged
+// in can compare that with who the server just answered for, and notice a login
+// or logout in another tab.
+type workspaceResponse struct {
+	Username  string     `json:"username"`
+	Workspace statusJSON `json:"workspace"`
+}
+
+func newWorkspaceResponse(user store.User, s workspace.Status) workspaceResponse {
+	return workspaceResponse{Username: user.Username, Workspace: newStatusJSON(s)}
+}
+
 func newStatusJSON(s workspace.Status) statusJSON {
 	ws := s.Workspace
 	out := statusJSON{
@@ -100,12 +114,13 @@ func (s *Server) handleWorkspaceStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWorkspaces(w) {
 		return
 	}
-	st, err := s.Workspaces.Status(r.Context(), userFrom(r.Context()))
+	user := userFrom(r.Context())
+	st, err := s.Workspaces.Status(r.Context(), user)
 	if err != nil {
 		s.workspaceError(w, "workspace status", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"workspace": newStatusJSON(st)})
+	writeJSON(w, http.StatusOK, newWorkspaceResponse(user, st))
 }
 
 // handleWorkspaceStart powers the workspace on and returns as soon as the
@@ -121,7 +136,7 @@ func (s *Server) handleWorkspaceStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("workspace start", "user", user.Username, "state", st.Workspace.State)
-	writeJSON(w, http.StatusOK, map[string]any{"workspace": newStatusJSON(st)})
+	writeJSON(w, http.StatusOK, newWorkspaceResponse(user, st))
 }
 
 func (s *Server) handleWorkspaceStop(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +150,7 @@ func (s *Server) handleWorkspaceStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Log.Info("workspace stop", "user", user.Username, "state", st.Workspace.State)
-	writeJSON(w, http.StatusOK, map[string]any{"workspace": newStatusJSON(st)})
+	writeJSON(w, http.StatusOK, newWorkspaceResponse(user, st))
 }
 
 func (s *Server) handleWorkspaceHeartbeat(w http.ResponseWriter, r *http.Request) {

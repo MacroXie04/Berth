@@ -128,9 +128,9 @@ export function createApi(opts: ApiOptions = {}): Api {
     logout: async () => {
       await request('POST', '/api/auth/logout', { anonymous: true })
     },
-    workspace: async (signal) => parseStatus(get(await request('GET', '/api/workspace', { signal }), 'workspace')),
-    start: async () => parseStatus(get(await request('POST', '/api/workspace/start'), 'workspace')),
-    stop: async () => parseStatus(get(await request('POST', '/api/workspace/stop'), 'workspace')),
+    workspace: async (signal) => parseReply(await request('GET', '/api/workspace', { signal })),
+    start: async () => parseReply(await request('POST', '/api/workspace/start')),
+    stop: async () => parseReply(await request('POST', '/api/workspace/stop')),
     heartbeat: async () => {
       await request('POST', '/api/workspace/heartbeat')
     },
@@ -181,6 +181,17 @@ function parseMeWorkspace(r: Record<string, unknown>): MeWorkspace {
     cpu_limit: num(r.cpu_limit),
     last_active_at: strOrNull(r.last_active_at),
   }
+}
+
+/**
+ * {"username": "...", "workspace": {...}}: the status, plus the account the
+ * server answered for. A backend without the username field gives a status
+ * without one (the page then skips its identity check).
+ */
+export function parseReply(body: unknown): WorkspaceStatus {
+  const status = parseStatus(get(body, 'workspace'))
+  const name = isRecord(body) ? body.username : undefined
+  return typeof name === 'string' && name !== '' ? { ...status, username: name } : status
 }
 
 export function parseStatus(r: Record<string, unknown>): WorkspaceStatus {

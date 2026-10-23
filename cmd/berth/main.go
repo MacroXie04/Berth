@@ -67,27 +67,9 @@ func run() error {
 	}
 	cancelPing()
 
-	workspaces, err := workspace.NewManager(st, dock, workspace.Config{
-		Image:                cfg.WorkspaceImage,
-		TraefikContainer:     cfg.TraefikContainer,
-		Entrypoint:           cfg.TraefikEntrypoint,
-		UDPPortMin:           cfg.UDPPortMin,
-		UDPPortMax:           cfg.UDPPortMax,
-		UDPPortsPerWorkspace: cfg.UDPPortsPerWorkspace,
-		Resolution:           cfg.Resolution,
-		PublicIP:             cfg.PublicIP,
-		ShmSizeMB:            cfg.ShmSizeMB,
-		PidsLimit:            int64(cfg.PidsLimit),
-		StopTimeout:          cfg.StopTimeout,
-		StartTimeout:         cfg.StartTimeout,
-	}, log, nil)
+	workspaces, err := newWorkspaceManager(cfg, st, dock, log)
 	if err != nil {
 		return err
-	}
-	if cfg.PublicIP == "" {
-		log.Warn("BERTH_PUBLIC_IP is not set: workspace video (WebRTC) only connects for browsers that can reach " +
-			"the Docker bridge network, i.e. the Docker host itself. Set it to the address browsers use to reach this " +
-			"host (its LAN address on a LAN, its public address on the internet).")
 	}
 	go keepProxyAttached(ctx, workspaces, log, cfg.ProxyAttachInterval)
 

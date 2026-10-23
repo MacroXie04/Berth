@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { createRef } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { STORAGE_KEY } from '../split'
@@ -191,5 +194,54 @@ describe('persistence', () => {
     expect(now(sep)).toBe(55)
     expect(getItem).toHaveBeenCalled()
     expect(setItem).toHaveBeenCalled()
+  })
+})
+
+describe('the pane divider as a place for focus (Shift+Esc in the terminal lands here)', () => {
+  it('hands its element to dividerRef, and it takes focus', () => {
+    mockMatchMedia(false)
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(1010, 610))
+    const ref = createRef<HTMLDivElement>()
+    render(<SplitView label="Resize panes" dividerRef={ref} first={<p>t</p>} second={<p>b</p>} />)
+    const sep = screen.getByRole('separator', { name: 'Resize panes' })
+    expect(ref.current).toBe(sep)
+    ref.current!.focus()
+    expect(sep).toHaveFocus()
+  })
+})
+
+describe('when the panes are stacked', () => {
+  const css = readFileSync(resolve(import.meta.dirname, '../styles.css'), 'utf8')
+
+  /** Evaluates STACK_QUERY (max-width and min-height conditions only) for a viewport. */
+  function stackedAt(width: number, height: number): boolean {
+    const maxWidth = Number(/\(max-width:\s*(\d+)px\)/.exec(STACK_QUERY)?.[1])
+    const minHeight = Number(/\(min-height:\s*(\d+)px\)/.exec(STACK_QUERY)?.[1])
+    return width <= maxWidth && height >= minHeight
+  }
+
+  it('narrow and tall screens stack; phones held sideways and wide screens do not', () => {
+    expect(stackedAt(360, 740)).toBe(true) // phone, portrait
+    expect(stackedAt(768, 1024)).toBe(true) // tablet, portrait
+    expect(stackedAt(667, 375)).toBe(false) // phone, landscape: two 140 px panes do not fit under the status bar
+    expect(stackedAt(740, 360)).toBe(false)
+    expect(stackedAt(1400, 800)).toBe(false) // desktop
+  })
+
+  it('styles.css switches the flex direction with exactly the same query as STACK_QUERY', () => {
+    // CSS cannot import the constant; this is what keeps the two from drifting apart.
+    const rule = new RegExp(
+      `@media ${STACK_QUERY.replace(/[()]/g, '\\$&')}\\s*\\{\\s*\\.split\\s*\\{\\s*flex-direction:\\s*column;`,
+    )
+    expect(css).toMatch(rule)
+  })
+
+  it('and no other rule in styles.css decides on the same breakpoint', () => {
+    expect(css.match(/max-width:\s*900px/g)).toHaveLength(1)
+    expect(css.match(/min-height:\s*480px/g)).toHaveLength(1)
+  })
+
+  it('the side-by-side direction is the default, so a short landscape viewport keeps it', () => {
+    expect(css).toMatch(/\.split\s*\{[^}]*flex-direction:\s*row;/)
   })
 })

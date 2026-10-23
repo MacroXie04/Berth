@@ -3,6 +3,8 @@ import type { Health, WorkspaceState, WorkspaceStatus } from './types'
 
 export const POLL_STARTING_MS = 2000
 export const POLL_RUNNING_MS = 10_000
+/** While the last status request failed, try again this often whatever the state. */
+export const POLL_RETRY_MS = 5000
 export const HEARTBEAT_MS = 30_000
 /** After this long in "starting" the page admits that it is slower than usual. */
 export const SLOW_START_SECONDS = 60
@@ -24,17 +26,27 @@ export type View =
  * Delay until the next status poll for a workspace in `state`, or null when
  * nothing needs polling (offline/stopped change only when the user acts).
  * Unknown state (no status yet, e.g. the first request failed) retries fast.
+ *
+ * While the last request `failing`, the page keeps asking every
+ * POLL_RETRY_MS (faster states keep their own faster pace), offline and stopped
+ * included: otherwise "Not up to date" would stay for ever next to a state
+ * nobody polls any more.
  */
-export function pollDelay(state: WorkspaceState | null): number | null {
+export function pollDelay(state: WorkspaceState | null, failing = false): number | null {
+  let base: number | null
   switch (state) {
     case null:
     case 'starting':
-      return POLL_STARTING_MS
+      base = POLL_STARTING_MS
+      break
     case 'running':
-      return POLL_RUNNING_MS
+      base = POLL_RUNNING_MS
+      break
     default:
-      return null
+      base = null
   }
+  if (!failing) return base
+  return base === null ? POLL_RETRY_MS : Math.min(base, POLL_RETRY_MS)
 }
 
 /** Whether the tab should be sending heartbeats. */
@@ -124,6 +136,30 @@ export function announcement(view: View, status: WorkspaceStatus | null): string
       return 'Your workspace is running'
     case 'cta':
       return status?.state === 'stopped' ? 'Your workspace is stopped' : 'Your workspace is offline'
+  }
+}
+
+/**
+ * Headline and text of the call to action for a workspace that is not running.
+ * "Offline" has several histories, and the text must not claim one that did not
+ * happen: never started (a new account: no timestamps at all), or no container
+ * for some other reason (removed after a long stop, crashed, removed by hand).
+ */
+export function ctaCopy(status: WorkspaceStatus): { title: string; text: string } {
+  if (status.state === 'stopped') {
+    return {
+      title: 'Your workspace is powered off',
+      text:
+        'It was stopped, by you or after sitting idle. Powering on starts it again in a few seconds. ' +
+        'Your files are kept: everything in your home directory is there when it comes back.',
+    }
+  }
+  const neverStarted = status.last_active_at === null && status.last_stopped_at === null
+  return {
+    title: 'Your workspace is not running',
+    text: neverStarted
+      ? 'Your workspace has not been started yet. Power on creates it; your files are kept from then on.'
+      : 'There is no running container right now. Power on creates a fresh one; everything in your home directory is kept.',
   }
 }
 

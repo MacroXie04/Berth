@@ -134,17 +134,27 @@ async function waitForVideo(page, what) {
   )
 }
 
-// UDP sockets bound inside the container (hex port -> count), from /proc/net/udp
-function udpPorts() {
-  const out = dockerTry('exec', CONTAINER, 'cat', '/proc/net/udp')
-  if (!out) return null
-  return out
-    .split('\n')
-    .slice(1)
-    .map((l) => l.trim().split(/\s+/))
-    .filter((c) => c.length > 3)
-    .map((c) => parseInt(c[1].split(':')[1], 16))
+// Every UDP socket bound inside the container, as {ip, port}, from /proc/net/udp (and udp6 when the container has IPv6).
+// Docker's embedded DNS resolver (127.0.0.11, a random port of its own) is left out. null = could not be read.
+function udpSockets() {
+  const v4 = dockerTry('exec', CONTAINER, 'cat', '/proc/net/udp')
+  if (v4 === null) return null
+  const rows = (text) =>
+    (text ?? '')
+      .split('\n')
+      .slice(1)
+      .map((l) => l.trim().split(/\s+/))
+      .filter((c) => c.length > 3)
+      .map((c) => c[1].split(':'))
+  // "030014AC" is 172.20.0.3 (the bytes of a little-endian address, as hex)
+  const dotted = (hex) => hex.match(/../g).reverse().map((b) => parseInt(b, 16)).join('.')
+  const found = [
+    ...rows(v4).map(([ip, port]) => ({ ip: dotted(ip), port: parseInt(port, 16) })),
+    ...rows(dockerTry('exec', CONTAINER, 'sh', '-c', 'cat /proc/net/udp6 2>/dev/null; true')).map(([ip, port]) => ({ ip: `[${ip}]`, port: parseInt(port, 16) })),
+  ]
+  return found.filter((s) => s.ip !== '127.0.0.11')
 }
+const socketKeys = (list) => (list ?? []).map((s) => `${s.ip}:${s.port}`).sort()
 
 const ctx = await browser.newContext({ viewport: { width: 1400, height: 800 } })
 const page = await newPage(ctx)
@@ -165,10 +175,16 @@ try {
     await login(page)
   }
 
-  await run('login shows the workspace page; a missing container is "offline" with a Power on button', async () => {
+  await run('login shows the workspace page; a container removed behind the backend\'s back is noticed: state "offline", a Power on button', async () => {
     await page.getByRole('button', { name: 'Log out' }).waitFor()
-    if (DOCKER) await page.getByRole('button', { name: 'Power on' }).waitFor({ timeout: 15000 })
-    return DOCKER ? 'offline, call to action' : 'logged in'
+    if (!DOCKER) return 'logged in'
+    // The call to action looks the same for "stopped" and "offline", so ask for the state itself, and read the badge.
+    await page.getByRole('button', { name: 'Power on' }).waitFor({ timeout: 15000 })
+    const st = await workspaceState(page)
+    if (st !== 'offline') throw new Error(`/api/workspace says "${st}" after the container was removed, expected "offline"`)
+    const badge = (await page.locator('.badge').innerText()).trim()
+    if (badge !== 'Offline') throw new Error(`the status bar says "${badge}", expected "Offline"`)
+    return 'state offline, badge Offline, call to action'
   })
 
   await run('Power on from a cold start: progress, then terminal + browser panes', async () => {
@@ -217,7 +233,7 @@ try {
       if (bindings.length !== 1) throw new Error(`published ports: ${bindings.join(',')}`)
       if (!env.NEKO_WEBRTC_UDPMUX || env.NEKO_WEBRTC_EPR) throw new Error(`env mux=${env.NEKO_WEBRTC_UDPMUX} epr=${env.NEKO_WEBRTC_EPR}`)
       const port = Number(bindings[0].split('/')[0])
-      const bound = (udpPorts() ?? []).filter((p) => p === port)
+      const bound = (udpSockets() ?? []).filter((x) => x.port === port)
       if (bound.length !== 1) throw new Error(`sockets bound to ${port}: ${bound.length}`)
       return `udp/${port}`
     })
@@ -265,6 +281,8 @@ try {
     return 'ok'
   })
 
+  // Everything bound for UDP in the container while one tab is open: what must be there again after a second tab came and went.
+  const udpBefore = DOCKER ? socketKeys(udpSockets()) : null
   const second = await newPage(ctx)
   await run('a second tab: its own neko session; the first tab keeps playing (no "opened in another tab")', async () => {
     await second.goto(BASE + '/')
@@ -280,13 +298,23 @@ try {
   await second.close()
 
   if (DOCKER) {
-    await run('closing tabs does not leak: still one UDP socket bound for the workspace', async () => {
+    await run('closing tabs does not leak: the set of UDP sockets bound in the container is the one from before the second tab', async () => {
+      if (udpBefore === null || udpBefore.length === 0) throw new Error('could not read /proc/net/udp in the container')
       await sleep(8000) // a closed peer lingers a few seconds
-      const info = JSON.parse(docker('inspect', CONTAINER))[0]
-      const port = Number(Object.keys(info.HostConfig.PortBindings)[0].split('/')[0])
-      const bound = (udpPorts() ?? []).filter((p) => p === port).length
-      if (bound !== 1) throw new Error(`sockets bound to ${port}: ${bound}`)
-      return `1 socket on udp/${port}`
+      // A leaked socket stays for ever; one that belongs to the remote Chromium's own traffic goes away by itself. Wait for equality.
+      let now = []
+      await waitFor(
+        () => {
+          now = socketKeys(udpSockets())
+          return JSON.stringify(now) === JSON.stringify(udpBefore)
+        },
+        { timeout: 20000, interval: 1000, what: 'the UDP sockets to be the same as before' },
+      ).catch(() => {
+        const extra = now.filter((k) => !udpBefore.includes(k))
+        const gone = udpBefore.filter((k) => !now.includes(k))
+        throw new Error(`UDP sockets differ from before the second tab: new ${JSON.stringify(extra)}, gone ${JSON.stringify(gone)}`)
+      })
+      return `${udpBefore.length} socket(s), unchanged: ${udpBefore.join(', ')}`
     })
   }
 

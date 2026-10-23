@@ -3,7 +3,7 @@
 //   BASE_URL=http://127.0.0.1:18090 node e2e/smoke.mjs        # `npm run e2e`
 //
 // BASE_URL        where the app is served (SPA + /api + /ws). Default http://127.0.0.1:18090.
-// SERVE_DIST=1    instead serve internal/webui/dist locally with the strict CSP (e2e/serve-dist.mjs)
+// SERVE_DIST=1    instead serve internal/webui/dist locally with the CSP of the Go server (e2e/serve-dist.mjs)
 //                 and forward /api and /ws to BASE_URL. For a stack whose backend does not serve
 //                 the web page yet. With the Go server serving the page, leave it off.
 // E2E_USER, E2E_PASSWORD   an existing user whose workspace is RUNNING (default alice / "correct horse").
@@ -179,6 +179,9 @@ async function live() {
     await page.getByRole('button', { name: 'Log in' }).click()
     await page.getByRole('alert').filter({ hasText: 'invalid username or password' }).waitFor()
     if (await page.getByText(/session expired/i).count()) throw new Error('shows "session expired" for a wrong password')
+    // The page moves focus to the (emptied) password field; inputs are read-only, not disabled, while the request runs.
+    const focused = await page.evaluate(() => document.activeElement?.getAttribute('name') ?? document.activeElement?.tagName)
+    if (focused !== 'password') throw new Error(`focus is on ${focused} after a failed login, expected the password field`)
   })
 
   await check('login shows the running workspace: status bar, terminal and browser panes', async () => {
@@ -219,7 +222,7 @@ async function live() {
     await shot(page, '02-terminal')
   })
 
-  await check('terminal: theme colours, true colour and the selection highlight are applied (also under a strict CSP)', async () => {
+  await check('terminal: theme colours, true colour and the selection highlight are applied (under the served CSP, which allows inline styles for xterm.js)', async () => {
     const rgb = (c) => c.match(/\d+(\.\d+)?/g).slice(0, 3).map(Number)
     const fg = rgb(await page.evaluate(() => getComputedStyle(document.querySelector('.xterm-rows')).color))
     const ratio = contrast(fg, [20, 23, 31])
@@ -257,7 +260,52 @@ async function live() {
     await waitFor(() => termLine(page, 'café € 🙂'), { what: 'the UTF-8 line', timeout: 15000 })
   })
 
-  await check('terminal: 1 MB of multi-byte output (flow control) keeps the connection and ends cleanly', async () => {
+  await check('terminal: an emoji takes two cells like in the shell (Unicode 11), so editing around it does not eat the prompt', async () => {
+    // bash/readline counts U+1F600 as 2 columns. If the page counted 1, moving left over the emoji would land one column
+    // too far and the next character would overwrite the space after the prompt ("$X😀" instead of "$ X😀").
+    await page.locator('.term-host').click()
+    await page.keyboard.insertText('\u{1F600}')
+    await page.keyboard.press('ArrowLeft')
+    await page.keyboard.type('X')
+    const line = await waitFor(
+      async () => (await termRows(page)).split('\n').map((l) => l.trimEnd()).filter((l) => /\$ ?X/.test(l)).pop(),
+      { what: 'the edited prompt line' },
+    )
+    await page.keyboard.press('Control+C') // abandon the line: a fresh, empty prompt
+    if (!/\$ X😀$/.test(line)) throw new Error(`prompt line is ${JSON.stringify(line)}`)
+    return line
+  })
+
+  await check('keyboard: Shift+Esc leaves the terminal (nothing is sent to the shell); Tab reaches the browser pane, Shift+Tab comes back', async () => {
+    await page.locator('.term-host').click()
+    const hint = await page.locator('.pane__hint').innerText()
+    if (hint !== 'Shift+Esc leaves the terminal') throw new Error(`hint is ${JSON.stringify(hint)}`)
+    const described = await page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea')
+      const byId = (id) => document.getElementById(id ?? '')?.textContent
+      return { input: byId(ta?.getAttribute('aria-describedby')), pane: byId(document.querySelector('.pane--terminal')?.getAttribute('aria-describedby')) }
+    })
+    if (described.input !== hint || described.pane !== hint) throw new Error(`accessible description: ${JSON.stringify(described)}`)
+    const where = () =>
+      page.evaluate(() => {
+        const a = document.activeElement
+        return a?.getAttribute('role') ?? `${a?.tagName.toLowerCase()}${a?.getAttribute('title') ? `[${a.getAttribute('title')}]` : ''}.${a?.className}`
+      })
+    if ((await where()) !== 'textarea.xterm-helper-textarea') throw new Error(`focus starts on ${await where()}`)
+    const sent = ws.toServer.length
+    await page.keyboard.press('Shift+Escape')
+    if ((await where()) !== 'separator') throw new Error(`after Shift+Esc focus is on ${await where()}`)
+    await sleep(300)
+    if (ws.toServer.length !== sent) throw new Error(`Shift+Esc reached the shell: ${ws.toServer.slice(sent).map((m) => JSON.stringify(m.toString()))}`)
+    await page.keyboard.press('Tab')
+    if ((await where()) !== 'iframe[Remote browser].browser') throw new Error(`Tab from the divider goes to ${await where()}`)
+    await page.keyboard.press('Shift+Tab')
+    if ((await where()) !== 'separator') throw new Error(`Shift+Tab goes to ${await where()}`)
+    await page.keyboard.press('Shift+Tab')
+    if ((await where()) !== 'textarea.xterm-helper-textarea') throw new Error(`Shift+Tab again goes to ${await where()}`)
+  })
+
+  await check('terminal: 1 MB of multi-byte output keeps the connection and ends cleanly, no character is split', async () => {
     const before = ws.connections
     await typeLine(page, "yes 'é€🙂' | head -n 100000; echo flood-done-$((10*10))")
     await waitFor(() => termLine(page, 'flood-done-100'), { what: 'the end of the flood', timeout: 60000 })
@@ -460,6 +508,50 @@ async function live() {
     return `terminal ${Math.round(t.height)} px, browser ${Math.round(b.height)} px`
   })
 
+  await check('layout on a phone held sideways stays side by side without scrolling the page; a tall phone stacks', async () => {
+    const connectionsBefore = ws.connections
+    const out = []
+    for (const [w, h, stacked] of [
+      [667, 375, false],
+      [740, 360, false],
+      [360, 740, true],
+      [800, 480, true],
+    ]) {
+      await page.setViewportSize({ width: w, height: h })
+      await page.waitForTimeout(400)
+      const m = await page.evaluate(() => {
+        const box = (sel) => {
+          const b = document.querySelector(sel).getBoundingClientRect()
+          return { x: b.x, y: b.y, w: b.width, h: b.height, right: b.right, bottom: b.bottom }
+        }
+        return {
+          scrollH: document.documentElement.scrollHeight,
+          scrollW: document.documentElement.scrollWidth,
+          innerH: window.innerHeight,
+          innerW: window.innerWidth,
+          orientation: document.querySelector('[role=separator]').getAttribute('aria-orientation'),
+          term: box('.pane--terminal'),
+          browser: box('.pane--browser'),
+        }
+      })
+      const at = `${w}x${h}`
+      if (m.scrollH > m.innerH || m.scrollW > m.innerW) throw new Error(`${at}: the page scrolls (${m.scrollW}x${m.scrollH} in ${m.innerW}x${m.innerH})`)
+      if (m.orientation !== (stacked ? 'horizontal' : 'vertical')) throw new Error(`${at}: separator is ${m.orientation}`)
+      for (const [name, b] of [['terminal', m.term], ['browser', m.browser]]) {
+        if (b.right > m.innerW + 1 || b.bottom > m.innerH + 1) throw new Error(`${at}: the ${name} pane is cut off: ${JSON.stringify(b)}`)
+        if (b.h < 140 || b.w < 240) throw new Error(`${at}: the ${name} pane is too small: ${Math.round(b.w)}x${Math.round(b.h)}`)
+      }
+      const sideBySide = m.term.right <= m.browser.x + 1
+      if (sideBySide === stacked) throw new Error(`${at}: expected ${stacked ? 'stacked' : 'side by side'} panes, terminal ${JSON.stringify(m.term)} browser ${JSON.stringify(m.browser)}`)
+      out.push(`${at} ${stacked ? 'stacked' : 'row'} ${Math.round(m.term.h)}px`)
+      if (w === 667) await shot(page, '05b-landscape')
+    }
+    await page.setViewportSize({ width: 1400, height: 800 })
+    await page.waitForTimeout(400)
+    if (ws.connections !== connectionsBefore) throw new Error('the terminal reconnected when the layout changed')
+    return out.join(', ')
+  })
+
   await check('contrast of text is at least 4.5:1 in light and dark mode', async () => {
     const out = []
     for (const scheme of ['light', 'dark']) {
@@ -479,7 +571,7 @@ async function live() {
           }
           return [255, 255, 255]
         }
-        const sel = ['.statusbar__brand', '.statusbar__user', '.badge', '.health--healthy', '.usage dt', '.usage dd', '.pane__title', '.pane__sub', '.btn:not(:disabled)', '.btn--quiet']
+        const sel = ['.statusbar__brand', '.statusbar__user', '.badge', '.health--healthy', '.usage dt', '.usage dd', '.pane__title', '.pane__sub', '.pane__hint', '.btn:not(:disabled)', '.btn--quiet']
         return sel
           .map((s) => document.querySelector(s))
           .map((el, i) => {
@@ -547,11 +639,17 @@ function makeStub(initial = {}) {
     requests: [],
     heartbeats: 0,
     expired: false,
+    user: 'alice', // whose session cookie the "browser" holds: /api/me and every workspace answer name him
+    registerError: null, // {status, error}
     wsConnections: 0,
     wsClosed: 0,
     wsFrames: [],
+    wsUrls: [],
+    sockets: [],
     ...initial,
   }
+  // Server -> terminal: an OUTPUT frame on the newest fake ttyd socket.
+  s.say = (text) => s.sockets[s.sockets.length - 1].send(Buffer.concat([Buffer.from('0'), Buffer.from(text)]))
   s.workspace = () => ({
     state: s.state,
     health: s.health,
@@ -562,6 +660,8 @@ function makeStub(initial = {}) {
     usage: s.state === 'running' ? { cpu_percent: 3.2, mem_bytes: 300 * 2 ** 20, mem_limit_bytes: 2 * 2 ** 30, pids: 20 } : null,
     ...(s.state === 'running' || s.state === 'starting' ? { neko_password: 'stub-neko-pw' } : {}),
   })
+  // What the real backend answers: the account the cookie belongs to, and its workspace.
+  s.reply = () => ({ username: s.user, workspace: s.workspace() })
   return s
 }
 
@@ -571,11 +671,17 @@ async function wireStub(page, s) {
     const req = route.request()
     const path = new URL(req.url()).pathname
     s.requests.push({ method: req.method(), path, contentType: req.headers()['content-type'] ?? null, body: req.postData() })
-    if (path === '/api/auth/register') return json(route, 201, { user: { id: 2, username: 'bob', is_admin: false }, workspace: {} })
-    if (path === '/api/auth/login') return json(route, 200, { user: { id: 2, username: 'bob', is_admin: false } })
+    if (path === '/api/auth/register') {
+      if (s.registerError) return json(route, s.registerError.status, { error: s.registerError.error })
+      return json(route, 201, { user: { id: 2, username: 'bob', is_admin: false }, workspace: {} })
+    }
+    if (path === '/api/auth/login') {
+      s.user = 'bob'
+      return json(route, 200, { user: { id: 2, username: 'bob', is_admin: false } })
+    }
     if (path === '/api/auth/logout') return route.fulfill({ status: 204 })
     if (s.expired) return json(route, 401, { error: 'not logged in' })
-    if (path === '/api/me') return json(route, 200, { user: { id: 1, username: 'alice', is_admin: false }, workspace: { state: s.state, mem_limit_mb: 2048, cpu_limit: 2, last_active_at: null } })
+    if (path === '/api/me') return json(route, 200, { user: { id: 1, username: s.user, is_admin: false }, workspace: { state: s.state, mem_limit_mb: 2048, cpu_limit: 2, last_active_at: null } })
     if (path === '/api/workspace/heartbeat') {
       s.heartbeats++
       return route.fulfill({ status: 204 })
@@ -584,19 +690,19 @@ async function wireStub(page, s) {
       if (s.startError) return json(route, s.startError.status, { error: s.startError.error })
       s.state = 'starting'
       s.pollsWhileStarting = 0
-      return json(route, 200, { workspace: s.workspace() })
+      return json(route, 200, s.reply())
     }
     if (path === '/api/workspace/stop') {
       s.state = 'stopped'
       s.health = 'none'
-      return json(route, 200, { workspace: s.workspace() })
+      return json(route, 200, s.reply())
     }
     if (path === '/api/workspace') {
       if (s.state === 'starting' && ++s.pollsWhileStarting >= 2) {
         s.state = 'running'
         s.health = 'healthy'
       }
-      return json(route, 200, { workspace: s.workspace() })
+      return json(route, 200, s.reply())
     }
     return json(route, 404, { error: 'not found' })
   })
@@ -606,6 +712,8 @@ async function wireStub(page, s) {
   // A tiny ttyd: handshake, then echo input back as output.
   await page.routeWebSocket(/\/ws\/[^/]+\/terminal\/ws$/, (route) => {
     s.wsConnections++
+    s.wsUrls.push(route.url())
+    s.sockets.push(route)
     let greeted = false
     route.onClose(() => s.wsClosed++)
     route.onMessage((m) => {
@@ -631,6 +739,9 @@ async function stub() {
     // The app asks /api/me first; the stub says logged in.
     await page.getByRole('button', { name: 'Power on' }).waitFor()
     if (!(await page.getByText(/your files are kept/i).count())) throw new Error('no data-kept sentence')
+    // The stub's workspace was never started (no timestamps): the text must not claim a container was removed.
+    if (!(await page.getByText('Your workspace has not been started yet.', { exact: false }).count())) throw new Error('no first-run text')
+    if (await page.getByText(/removed/i).count()) throw new Error('claims that a container was removed')
     if (await page.locator('iframe').count()) throw new Error('iframe mounted while offline')
     await shot(page, 's1-cta')
 
@@ -754,6 +865,78 @@ async function stub() {
     await ctx.close()
   })
 
+  await check('stub: Escape and Tab still reach the shell; Shift+Esc does not, and moves focus to the divider', async () => {
+    const s = makeStub({ state: 'running', health: 'healthy' })
+    const { ctx, page } = await newPage()
+    await wireStub(page, s)
+    await page.goto(`${APP}/`)
+    await page.getByRole('separator').waitFor()
+    await waitFor(() => termLine(page, 'fake$'), { what: 'fake prompt' })
+    await page.locator('.term-host').click()
+    const frames = () => s.wsFrames.map((f) => f.toString('latin1'))
+    const active = () => page.evaluate(() => document.activeElement?.getAttribute('role') ?? document.activeElement?.tagName.toLowerCase())
+    const n = s.wsFrames.length
+    await page.keyboard.press('Escape')
+    await page.keyboard.press('Tab')
+    await waitFor(() => frames().slice(n).join('|') === '0\x1b|0\t', { what: 'Escape and Tab as INPUT frames' })
+    if ((await active()) !== 'textarea') throw new Error(`Tab/Escape moved focus to ${await active()}`)
+    const m = s.wsFrames.length
+    await page.keyboard.press('Shift+Escape')
+    if ((await active()) !== 'separator') throw new Error(`Shift+Esc: focus is on ${await active()}`)
+    await sleep(300)
+    if (s.wsFrames.length !== m) throw new Error(`Shift+Esc reached the shell: ${JSON.stringify(frames().slice(m))}`)
+    await page.keyboard.press('Tab')
+    if ((await active()) !== 'iframe') throw new Error(`Tab from the divider: focus is on ${await active()}`)
+    await ctx.close()
+  })
+
+  await check('stub: an emoji advances the cursor by two cells (Unicode 11); a letter by one', async () => {
+    const s = makeStub({ state: 'running', health: 'healthy' })
+    const { ctx, page } = await newPage()
+    await wireStub(page, s)
+    await page.goto(`${APP}/`)
+    await page.getByRole('separator').waitFor()
+    await waitFor(() => termLine(page, 'fake$'), { what: 'fake prompt' })
+    // Print on a fresh line, then ask the terminal where its cursor is (DSR, ESC[6n): it answers ESC[row;colR as input.
+    const column = async (text) => {
+      const n = s.wsFrames.length
+      s.say(`\r\n${text}\x1b[6n`)
+      const frame = await waitFor(() => s.wsFrames.slice(n).map((f) => f.toString('latin1')).find((f) => /^0\x1b\[\d+;\d+R$/.test(f)), { what: 'a cursor position report' })
+      return Number(/;(\d+)R$/.exec(frame)[1])
+    }
+    const letter = await column('x')
+    const emoji = await column('\u{1F600}')
+    const cjk = await column('\u6f22')
+    if (letter !== 2) throw new Error(`cursor column after a letter: ${letter}, expected 2`)
+    if (emoji !== 3) throw new Error(`cursor column after an emoji: ${emoji}, expected 3 (it took ${emoji - 1} cell)`)
+    if (cjk !== 3) throw new Error(`cursor column after a CJK character: ${cjk}, expected 3`)
+    await ctx.close()
+  })
+
+  await check('stub: a status answer for another account (another tab logged in as someone else) sends the page back to /api/me', async () => {
+    const s = makeStub({ state: 'running', health: 'healthy' })
+    const { ctx, page } = await newPage()
+    await page.clock.install()
+    await wireStub(page, s)
+    await page.goto(`${APP}/`)
+    await page.getByRole('separator').waitFor()
+    await page.locator('.statusbar__user', { hasText: 'alice' }).waitFor()
+    const meBefore = s.requests.filter((r) => r.path === '/api/me').length
+    const socketsBefore = s.wsUrls.length
+    s.user = 'bob' // the other tab logged in as bob: the cookie both tabs share now belongs to him
+    await tick(page, 10_500)
+    await page.locator('.statusbar__user', { hasText: 'bob' }).waitFor({ timeout: 10000 })
+    await page.getByRole('separator').waitFor()
+    const meAfter = s.requests.filter((r) => r.path === '/api/me').length
+    if (meAfter !== meBefore + 1) throw new Error(`/api/me calls: ${meBefore} -> ${meAfter}, expected one more`)
+    const src = await page.locator('iframe[title="Remote browser"]').getAttribute('src')
+    if (!src.startsWith('/ws/bob/browser/')) throw new Error(`iframe src ${src}`)
+    const opened = s.wsUrls.slice(socketsBefore)
+    if (opened.length === 0 || opened.some((u) => !u.includes('/ws/bob/terminal/'))) throw new Error(`terminal sockets opened after the swap: ${JSON.stringify(opened)}`)
+    if ((await page.locator('.xterm').count()) !== 1) throw new Error('more than one terminal')
+    await ctx.close()
+  })
+
   await check('stub: a 401 from the API returns to the login page with a message', async () => {
     const s = makeStub({ state: 'running', health: 'healthy' })
     const { ctx, page } = await newPage()
@@ -789,11 +972,19 @@ async function stub() {
     if (s.requests.some((r) => r.path.startsWith('/api/auth/'))) throw new Error('a request was sent with invalid fields')
     await page.getByLabel('Username').fill('bob')
     await page.getByLabel('Password').fill('correct horse battery')
+    // a taken name: reported on the username field, and focus goes there (the inputs are read-only, not disabled, meanwhile)
+    s.registerError = { status: 409, error: 'username already taken' }
+    await page.getByLabel('Password').focus()
+    await page.getByRole('button', { name: 'Create account' }).click()
+    await page.getByText('That username is already taken.').waitFor()
+    const focused = await page.evaluate(() => document.activeElement?.getAttribute('name') ?? document.activeElement?.tagName)
+    if (focused !== 'username') throw new Error(`focus is on ${focused} after "taken", expected the username field`)
+    s.registerError = null
     s.expired = false
     await page.getByRole('button', { name: 'Create account' }).click()
     await page.getByRole('button', { name: 'Log out' }).waitFor()
     const auth = s.requests.filter((r) => r.path.startsWith('/api/auth/')).map((r) => `${r.method} ${r.path} ${r.contentType}`)
-    const want = ['POST /api/auth/register application/json', 'POST /api/auth/login application/json']
+    const want = ['POST /api/auth/register application/json', 'POST /api/auth/register application/json', 'POST /api/auth/login application/json']
     if (JSON.stringify(auth) !== JSON.stringify(want)) throw new Error(`auth calls: ${JSON.stringify(auth)}`)
     await ctx.close()
   })

@@ -55,7 +55,9 @@ const OPEN = 1
 /**
  * One terminal connection to a workspace's ttyd, with automatic reconnection
  * (exponential backoff, capped at 10 s). Every reconnect is a NEW shell: ttyd
- * starts one process per WebSocket and ends it when the socket closes.
+ * starts one process per WebSocket and sends it SIGHUP when the socket closes
+ * (a bash that is sitting at readline's "Display all N possibilities?" prompt
+ * ignores it and outlives the socket; known limitation, see web/README.md).
  */
 export class TtydSession {
   private socket: SocketLike | null = null
@@ -178,15 +180,25 @@ export class TtydSession {
         if (msg.text === '') return
         const fc = this.flow.onWrite(msg.bytes)
         if (fc.send) this.send(fc.send)
-        this.opts.write(
-          msg.text,
-          fc.track
-            ? () => {
-                const cmd = this.flow.done()
-                if (cmd) this.send(cmd)
-              }
-            : undefined,
-        )
+        // The completion callback runs at most once, whether xterm calls it or
+        // the write itself fails below.
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          const cmd = this.flow.done()
+          if (cmd) this.send(cmd)
+        }
+        try {
+          this.opts.write(msg.text, fc.track ? finish : undefined)
+        } catch {
+          // xterm throws ("write data discarded") when its queue is over its cap.
+          // That must not escape the socket handler, and the write that never got
+          // queued must not stay counted as outstanding (nothing would ever
+          // finish it, and a PAUSE sent for it would never be followed by a
+          // RESUME). The chunk is lost; the stream goes on.
+          if (fc.track) finish()
+        }
         return
       }
       case 'title':

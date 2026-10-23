@@ -1,5 +1,6 @@
 // A stand-in for the Go backend's static serving, for browser tests: serves the
-// production build (internal/webui/dist) with a strict Content-Security-Policy,
+// production build (internal/webui/dist) with the Content-Security-Policy the Go
+// server sends (DEFAULT_CSP below; src/csp.test.ts keeps the two equal),
 // falls back to index.html for unknown non-asset GET paths, and forwards /api
 // and /ws (WebSocket upgrades included) to a running Berth stack.
 //
@@ -19,7 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 
 export const DEFAULT_DIST = resolve(here, '../../internal/webui/dist')
 
-/** What the Go server is meant to send (CLAUDE.md, M3). Override with CSP=... */
+/** The policy of internal/webui/webui.go, copied; src/csp.test.ts fails if they differ. Override with CSP=... */
 export const DEFAULT_CSP = [
   "default-src 'self'",
   "script-src 'self'",

@@ -114,6 +114,48 @@ func TestCreateAcceptsAMemoryWithoutSwapWarning(t *testing.T) {
 	}
 }
 
+// The UDP block of a spec is published port for port, and nothing else is: one
+// port (the default) is one binding, a block of eight is eight, no block is none.
+func TestCreatePublishesExactlyTheSpecifiedUDPPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		start, end int
+		want       []string
+	}{
+		{"one port", 30005, 30005, []string{"30005/udp"}},
+		{"a block of three", 30010, 30012, []string{"30010/udp", "30011/udp", "30012/udp"}},
+		{"no block", 0, 0, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, m := newStubDaemon(t)
+			d.handlers["POST /containers/create"] = reply(201, `{"Id":"abc","Warnings":[]}`)
+			if _, err := m.CreateContainer(stubCtx(t), ContainerSpec{Name: "c", Image: "i", UDPPortStart: tc.start, UDPPortEnd: tc.end}); err != nil {
+				t.Fatal(err)
+			}
+			var body struct {
+				ExposedPorts map[string]struct{}
+				HostConfig   struct {
+					PortBindings map[string][]struct{ HostPort string }
+				}
+			}
+			raw := d.body("POST /containers/create")
+			if err := json.Unmarshal([]byte(raw), &body); err != nil {
+				t.Fatalf("%v: %s", err, raw)
+			}
+			if len(body.ExposedPorts) != len(tc.want) || len(body.HostConfig.PortBindings) != len(tc.want) {
+				t.Fatalf("exposed %v, bound %v; want exactly %v\n%s", body.ExposedPorts, body.HostConfig.PortBindings, tc.want, raw)
+			}
+			for _, port := range tc.want {
+				b := body.HostConfig.PortBindings[port]
+				// Published 1:1, so the host port is the container port.
+				if _, ok := body.ExposedPorts[port]; !ok || len(b) != 1 || b[0].HostPort+"/udp" != port {
+					t.Errorf("port %s: exposed=%v bindings=%v", port, body.ExposedPorts, b)
+				}
+			}
+		})
+	}
+}
+
 func TestEnsureNetworkReportsExhaustedAddressSpace(t *testing.T) {
 	d, m := newStubDaemon(t)
 	d.handlers["GET /networks/n"] = reply(404, `{"message":"network n not found"}`)

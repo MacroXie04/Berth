@@ -148,7 +148,7 @@ describe('TtydSession', () => {
     expect(t.titles).toEqual(['alice@box: ~'])
   })
 
-  it('pauses the server when the terminal falls behind and resumes when it catches up', () => {
+  it('sends PAUSE when the terminal falls behind and RESUME when it catches up (the protocol; ttyd 1.7.7 ignores both)', () => {
     const t = setup()
     t.session.start()
     const s = t.last()
@@ -158,6 +158,72 @@ describe('TtydSession', () => {
     expect(s.sent.some((m) => m.length === 1 && m[0] === PAUSE[0])).toBe(true)
     for (const d of t.dones) d?.()
     expect(s.sent.some((m) => m.length === 1 && m[0] === RESUME[0])).toBe(true)
+  })
+
+  describe('a terminal write that fails (xterm: "write data discarded")', () => {
+    const big = new Uint8Array(100_001).fill(0x61) // every frame is a tracked write
+
+    function failingFrom(n: number) {
+      let calls = 0
+      const t = setup({
+        write: (text, done) => {
+          if (calls++ >= n) throw new Error('write data discarded, use flow control to avoid losing data')
+          t.written.push(text)
+          t.dones.push(done)
+        },
+      })
+      return t
+    }
+    const commands = (s: FakeSocket) => s.sent.filter((m) => m.length === 1).map((m) => String.fromCharCode(m[0]!))
+
+    it('does not escape the socket handler, and the stream goes on', () => {
+      const t = failingFrom(1)
+      t.session.start()
+      const s = t.last()
+      s.open()
+      s.receive('0', enc.encode('first'))
+      expect(() => s.receive('0', enc.encode('lost'))).not.toThrow() // small, untracked write
+      expect(() => s.receive('0', big)).not.toThrow() // tracked write
+      expect(t.session.current.status).toBe('open')
+      expect(t.written).toEqual(['first'])
+    })
+
+    it('does not leave the failed write counted as outstanding: a PAUSE it caused is still followed by a RESUME', () => {
+      // 10 writes succeed and stay outstanding; the next 6 throw. The 11th tracked write crosses the high-water mark (PAUSE).
+      const t = failingFrom(10)
+      t.session.start()
+      const s = t.last()
+      s.open()
+      for (let i = 0; i < 16; i++) s.receive('0', big)
+      expect(commands(s)).toEqual(['2']) // PAUSE, once
+      // xterm now finishes the 10 writes it did accept. If the 6 that never got queued were still counted,
+      // 6 would stay outstanding for ever (above the low-water mark) and the RESUME would never come.
+      for (const d of t.dones) d?.()
+      expect(commands(s)).toEqual(['2', '3'])
+    })
+
+    it('counts a write once even if it both reports completion and throws', () => {
+      let reportAndThrow = false
+      const t = setup({
+        write: (text, done) => {
+          if (reportAndThrow) {
+            done?.()
+            throw new Error('boom')
+          }
+          t.written.push(text)
+          t.dones.push(done)
+        },
+      })
+      t.session.start()
+      const s = t.last()
+      s.open()
+      for (let i = 0; i < 11; i++) s.receive('0', big) // 11 outstanding: PAUSE
+      for (const d of t.dones.slice(0, 7)) d?.() // 4 outstanding: the low-water mark itself, not below it
+      expect(commands(s)).toEqual(['2'])
+      reportAndThrow = true
+      s.receive('0', big) // 5 outstanding, completed (4) ... and "failed" again, which must not count twice (3, below the mark)
+      expect(commands(s)).toEqual(['2'])
+    })
   })
 
   it('does not throw when the socket is already closing by the time it opens, and then retries', () => {

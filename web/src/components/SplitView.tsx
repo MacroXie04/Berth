@@ -9,6 +9,7 @@ import {
   type KeyboardEvent,
   type PointerEvent,
   type ReactNode,
+  type Ref,
 } from 'react'
 import {
   DEFAULT_RATIO,
@@ -24,8 +25,16 @@ import {
   type Layout,
 } from '../split'
 
-/** Below this width the panes are stacked instead of side by side. */
-export const STACK_QUERY = '(max-width: 900px)'
+/**
+ * The panes are stacked on a narrow screen that is also tall enough for two
+ * panes one above the other; a phone held sideways (narrow AND short) keeps
+ * them side by side, because the stacked panes' minimum heights do not fit it
+ * and the page would scroll.
+ *
+ * styles.css switches the flex direction with exactly this query; CSS cannot
+ * import this constant, so a test (SplitView.test.tsx) fails if they differ.
+ */
+export const STACK_QUERY = '(max-width: 900px) and (min-height: 480px)'
 
 function subscribe(query: string, cb: () => void): () => void {
   if (typeof window === 'undefined' || !window.matchMedia) return () => {}
@@ -51,6 +60,8 @@ interface Props {
   second: ReactNode
   /** Accessible name of the separator. */
   label: string
+  /** Lets the page move keyboard focus to the separator (Shift+Esc in the terminal). */
+  dividerRef?: Ref<HTMLDivElement>
 }
 
 /**
@@ -59,7 +70,7 @@ interface Props {
  * resets to 50/50. Pointer events cover mouse, touch and pen; a transparent
  * shield covers the panes while dragging so the iframe cannot swallow them.
  */
-export function SplitView({ first, second, label }: Props) {
+export function SplitView({ first, second, label, dividerRef }: Props) {
   const stacked = useStacked()
   const layout: Layout = stacked ? 'column' : 'row'
   const minPx = MIN_PANE_PX[layout]
@@ -142,6 +153,7 @@ export function SplitView({ first, second, label }: Props) {
         {first}
       </div>
       <div
+        ref={dividerRef}
         role="separator"
         tabIndex={0}
         aria-label={label}

@@ -3,12 +3,14 @@ import { ApiError } from './api'
 import type { Health, WorkspaceState, WorkspaceStatus } from './types'
 import {
   HEARTBEAT_MS,
+  POLL_RETRY_MS,
   POLL_RUNNING_MS,
   POLL_STARTING_MS,
   announcement,
   badgeFor,
   canPowerOff,
   canPowerOn,
+  ctaCopy,
   elapsedSeconds,
   heartbeatActive,
   isUnhealthy,
@@ -98,6 +100,18 @@ describe('scheduling', () => {
   it('retries quickly while the state is still unknown', () => {
     expect(pollDelay(null)).toBe(POLL_STARTING_MS)
   })
+  it('while the last request failed, asks again every 5 s whatever the state (offline and stopped included)', () => {
+    expect(POLL_RETRY_MS).toBe(5000)
+    expect(pollDelay('offline', true)).toBe(POLL_RETRY_MS)
+    expect(pollDelay('stopped', true)).toBe(POLL_RETRY_MS)
+    expect(pollDelay('running', true)).toBe(POLL_RETRY_MS) // sooner than the usual 10 s
+    expect(pollDelay('starting', true)).toBe(POLL_STARTING_MS) // already faster
+    expect(pollDelay(null, true)).toBe(POLL_STARTING_MS)
+  })
+  it('a request that did not fail changes nothing', () => {
+    expect(pollDelay('stopped', false)).toBeNull()
+    expect(pollDelay('running', false)).toBe(POLL_RUNNING_MS)
+  })
   it('heartbeats only while starting/running AND visible AND not powering off', () => {
     expect(HEARTBEAT_MS).toBe(30_000)
     expect(heartbeatActive('running', true, null)).toBe(true)
@@ -136,5 +150,39 @@ describe('start / stop error messages', () => {
     )
     expect(startErrorMessage(new Error('boom'))).toBe('Could not start the workspace.')
     expect(stopErrorMessage(new Error('boom'))).toBe('Could not power off the workspace.')
+  })
+})
+
+describe('ctaCopy', () => {
+  const fresh = ws('offline')
+  const used = (extra: Partial<WorkspaceStatus>) => ({ ...ws('offline'), ...extra })
+
+  it('a workspace that was never started says so, and does not claim a container was removed', () => {
+    const c = ctaCopy(fresh)
+    expect(c.title).toBe('Your workspace is not running')
+    expect(c.text).toBe(
+      'Your workspace has not been started yet. Power on creates it; your files are kept from then on.',
+    )
+  })
+
+  it.each([
+    ['last_stopped_at', { last_stopped_at: '2026-05-01 10:00:00' }],
+    ['last_active_at', { last_active_at: '2026-05-01 10:00:00' }],
+    ['both', { last_active_at: '2026-05-01 10:00:00', last_stopped_at: '2026-05-01 10:30:00' }],
+  ])('offline with %s set (it ran before) uses neutral wording', (_n, extra) => {
+    expect(ctaCopy(used(extra)).text).toBe(
+      'There is no running container right now. Power on creates a fresh one; everything in your home directory is kept.',
+    )
+  })
+
+  it('stopped keeps its own text and promise', () => {
+    const c = ctaCopy(ws('stopped'))
+    expect(c.title).toBe('Your workspace is powered off')
+    expect(c.text).toMatch(/^It was stopped, by you or after sitting idle\./)
+    expect(c.text).toMatch(/Your files are kept/)
+  })
+
+  it('a stopped workspace is never described as "never started", even with no timestamps', () => {
+    expect(ctaCopy(ws('stopped')).text).not.toMatch(/not been started/)
   })
 })

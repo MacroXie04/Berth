@@ -50,6 +50,16 @@ func newWSEnv(t *testing.T, mutate ...func(*workspace.Config)) *wsEnv {
 
 func wsBody(r resp) map[string]any { return r.json()["workspace"].(map[string]any) }
 
+// wsUser is the account a workspace response says it is about.
+func wsUser(t *testing.T, r resp) string {
+	t.Helper()
+	name, ok := r.json()["username"].(string)
+	if !ok {
+		t.Fatalf("response has no top-level username: %s", r.Body)
+	}
+	return name
+}
+
 func TestWorkspaceEndpointsRequireTheAPISession(t *testing.T) {
 	e := newWSEnv(t)
 	_, ws := e.registerAndLoginBoth("alice", "correct horse")
@@ -96,6 +106,9 @@ func TestWorkspaceLifecycleOverHTTP(t *testing.T) {
 	if r.Code != 200 {
 		t.Fatalf("status %d: %s", r.Code, r.Body)
 	}
+	if got := wsUser(t, r); got != "alice" {
+		t.Errorf("GET /api/workspace username = %q, want alice", got)
+	}
 	ws := wsBody(r)
 	if ws["state"] != "offline" || ws["health"] != "none" || ws["usage"] != nil || ws["mem_limit_mb"] != float64(2048) ||
 		ws["cpu_limit"] != float64(2) || ws["last_active_at"] != nil {
@@ -109,6 +122,9 @@ func TestWorkspaceLifecycleOverHTTP(t *testing.T) {
 	r = e.do("POST", "/api/workspace/start", "", nil, c)
 	if r.Code != 200 {
 		t.Fatalf("start: %d %s", r.Code, r.Body)
+	}
+	if got := wsUser(t, r); got != "alice" {
+		t.Errorf("POST /api/workspace/start username = %q, want alice", got)
 	}
 	ws = wsBody(r)
 	pw, _ := ws["neko_password"].(string)
@@ -148,6 +164,9 @@ func TestWorkspaceLifecycleOverHTTP(t *testing.T) {
 	// Power off: stopped, the password is no longer handed out, the stop time is set.
 	e.clock.Advance(time.Minute)
 	r = e.do("POST", "/api/workspace/stop", "", nil, c)
+	if got := wsUser(t, r); got != "alice" {
+		t.Errorf("POST /api/workspace/stop username = %q, want alice", got)
+	}
 	ws = wsBody(r)
 	if r.Code != 200 || ws["state"] != "stopped" || ws["last_stopped_at"] == nil || ws["usage"] != nil {
 		t.Errorf("stop: %d %v", r.Code, ws)
@@ -158,6 +177,48 @@ func TestWorkspaceLifecycleOverHTTP(t *testing.T) {
 	// /api/me reflects it too.
 	if st := e.do("GET", "/api/me", "", nil, c).json()["workspace"].(map[string]any)["state"]; st != "stopped" {
 		t.Errorf("/api/me workspace state = %v", st)
+	}
+}
+
+// The browser shares one cookie jar between its tabs, so a tab that logged in as
+// alice can find itself talking as bob after another tab switched accounts. The
+// answer must name the account of the cookie that was sent, and nothing else,
+// so the page can compare it with who it thinks it is.
+func TestWorkspaceResponsesNameTheAccountOfTheSessionCookie(t *testing.T) {
+	e := newWSEnv(t)
+	alice := e.registerAndLogin("alice", "correct horse")
+	bob := e.registerAndLogin("bob", "battery staple")
+
+	for _, tc := range []struct {
+		who    string
+		cookie *http.Cookie
+	}{{"alice", alice}, {"bob", bob}, {"alice", alice}} {
+		for _, ep := range []struct{ method, path string }{
+			{"GET", "/api/workspace"}, {"POST", "/api/workspace/start"}, {"POST", "/api/workspace/stop"},
+		} {
+			// A body naming the other account changes nothing.
+			other := map[string]string{"alice": "bob", "bob": "alice"}[tc.who]
+			body := ""
+			if ep.method == "POST" {
+				body = `{"username":"` + other + `"}`
+			}
+			r := e.do(ep.method, ep.path, body, nil, tc.cookie)
+			if r.Code != 200 {
+				t.Fatalf("%s %s as %s: %d %s", ep.method, ep.path, tc.who, r.Code, r.Body)
+			}
+			if got := wsUser(t, r); got != tc.who {
+				t.Errorf("%s %s with %s's cookie: username = %q", ep.method, ep.path, tc.who, got)
+			}
+			// The documented shape, exactly: the frontend relies on both keys.
+			m := r.json()
+			if len(m) != 2 || m["username"] == nil || m["workspace"] == nil {
+				t.Errorf("%s %s: body keys = %v, want exactly username and workspace", ep.method, ep.path, m)
+			}
+		}
+	}
+	// Heartbeat has no body to put it in.
+	if r := e.do("POST", "/api/workspace/heartbeat", "", nil, alice); r.Code != 204 || r.Body.Len() != 0 {
+		t.Errorf("heartbeat: %d %q, want 204 with no body", r.Code, r.Body)
 	}
 }
 

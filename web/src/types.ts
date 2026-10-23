@@ -29,6 +29,13 @@ export interface WorkspaceStatus {
   usage: Usage | null
   /** Present only while the container is starting or running. */
   neko_password?: string
+  /**
+   * Whose workspace the server answered for (top-level "username" of the
+   * response, which is the account that owns the session cookie). Absent from
+   * an older backend. The page compares it with the user it was opened for:
+   * another tab may have logged in as somebody else since.
+   */
+  username?: string
 }
 
 /** What GET /api/me reports about the workspace (database only). */

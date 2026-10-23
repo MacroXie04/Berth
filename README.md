@@ -49,6 +49,13 @@ curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspa
 
 > **Careful:** `docker compose down -v` deletes the `berth-state` volume, which holds every account. Per-user data volumes (`berth-data-*`) are never touched by Compose and would survive as orphans.
 
+### Upgrading
+
+`docker compose up -d --build` rebuilds the backend. Two things it does not do by itself:
+
+- Traefik reads `traefik/dynamic.yml` through a single-file bind mount. When an update replaces that file (`git pull` does), the running Traefik keeps the old content, and workspaces created by the new backend then 404 because their routers name a middleware the old file lacks. Recreate it: `docker compose up -d --force-recreate traefik` (users are reconnected within `BERTH_PROXY_ATTACH_INTERVAL`, 10 s by default).
+- A workspace container keeps the routing labels it was created with, so a workspace created by an older version does not get new routing settings (for example the `/ws` response headers below) until its container is recreated. To do that for one user: `docker rm -f berth-ws-<username>` (the data volume is untouched); the next power-on creates a fresh container with the same password and data.
+
 ### Host requirements
 
 - **Docker Engine 28 or newer.** When the backend attaches Traefik to a user's network it sets a low gateway priority, which Engine 28 (API 1.48) introduced; older engines ignore it, and the first power-on of every new user then resets the connections of everyone using Traefik. The backend logs an error at startup if it finds an older engine.
@@ -71,6 +78,8 @@ A login sets two `HttpOnly`, `SameSite=Lax` cookies with separate tokens:
 | `berth_ws` | `/ws` | only Traefik's ForwardAuth check |
 
 Traefik forwards the browser's cookies to the workspace container, where code running as the user could read them. Because the API token is never sent under `/ws`, such code cannot steal it. It is not a full isolation: the workspaces share the site's origin with the API, so a page served by a hostile workspace can still make the visitor's browser call `/api` as that visitor. Serving workspaces from their own origin closes this (CLAUDE.md, decision D4c).
+
+Everything under `/ws` also passes through Traefik's `berth-ws-headers` middleware (`traefik/dynamic.yml`): responses are `X-Frame-Options: SAMEORIGIN` with `frame-ancestors 'self'`, so only Berth's own page can frame a terminal or remote browser (a page on another port or subdomain of the same site could otherwise, with the visitor's cookies), and `Service-Worker-Allowed` is removed, so a workspace page cannot register a service worker for the whole site.
 
 Workspaces do not share a network: each container joins only its own `berth-net-<username>`, and the backend connects Traefik to that network. A workspace therefore cannot reach other workspaces or the backend. Logging out revokes both tokens, but an already-open terminal or browser stream stays connected until it closes.
 
@@ -98,6 +107,7 @@ Without a build `GET /` answers `503 frontend not built` while the API keeps wor
 ```sh
 go vet ./... && go test ./...                          # unit tests, no Docker needed
 go test -tags integration ./internal/docker            # the Docker wrapper against a real daemon
+BERTH_TEST_TRAEFIK=/path/to/traefik go test -tags integration -run Traefik ./internal/workspace   # the /ws routes through a real Traefik
 ```
 
 Build with `GOTOOLCHAIN=local` so Go never silently downloads a newer toolchain. `go.mod` requires Go 1.24 (the spec asks for 1.22+): that is the oldest release the security-fixed `golang.org/x/crypto` and a current SQLite (`modernc.org/sqlite`) support. The Docker image builds with a current Go release.
@@ -111,8 +121,8 @@ Build with `GOTOOLCHAIN=local` so Go never silently downloads a newer toolchain.
 | POST | `/api/auth/logout` | revokes the session, clears both cookies |
 | GET | `/api/auth/check` | Traefik ForwardAuth: 200 / 401 (no session) / 403 (not your workspace). Internal: not routed through Traefik |
 | GET | `/api/me` | current user and workspace |
-| GET | `/api/workspace` | state, health, resource usage (`cpu_percent` is `docker stats` style: 100 = one core), and the browser view's password while it is up |
-| POST | `/api/workspace/start` | power on (idempotent); returns once the container is started, then poll `GET /api/workspace` for `"state":"running"` |
-| POST | `/api/workspace/stop` | power off (idempotent); keeps the container and data |
+| GET | `/api/workspace` | `{username, workspace}`: state, health, resource usage (`cpu_percent` is `docker stats` style: 100 = one core), and the browser view's password while it is up |
+| POST | `/api/workspace/start` | power on (idempotent); answers like `GET /api/workspace` once the container is started, then poll that for `"state":"running"` |
+| POST | `/api/workspace/stop` | power off (idempotent); keeps the container and data; same answer |
 | POST | `/api/workspace/heartbeat` | records activity; 204 |
 | GET | `/healthz` | liveness. Internal: not routed through Traefik |

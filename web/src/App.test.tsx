@@ -1,9 +1,17 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App, SESSION_EXPIRED } from './App'
 
+// Every user a terminal was ever mounted for, in order.
+const mounted: string[] = []
 vi.mock('./components/TerminalPane', () => ({
-  TerminalPane: () => <div data-testid="terminal" />,
+  TerminalPane: ({ username }: { username: string }) => {
+    useEffect(() => {
+      mounted.push(username)
+    }, [username])
+    return <div data-testid="terminal" data-user={username} />
+  },
 }))
 
 interface Call {
@@ -35,6 +43,12 @@ const STOPPED = {
 
 let calls: Call[]
 let handlers: Record<string, Handler>
+
+const RUNNING = (username?: string) => ({
+  ...(username ? { username } : {}),
+  workspace: { ...STOPPED.workspace, state: 'running', health: 'healthy', neko_password: 'pw' },
+})
+const ME_OF = (username: string) => ({ user: { id: 1, username, is_admin: false }, workspace: ME.workspace })
 
 function install() {
   calls = []
@@ -75,6 +89,7 @@ const type = (el: HTMLElement, value: string) => fireEvent.change(el, { target: 
 beforeEach(() => {
   vi.useFakeTimers()
   localStorage.clear()
+  mounted.length = 0
   handlers = {
     'GET /api/workspace': () => json(200, STOPPED),
   }
@@ -284,5 +299,84 @@ describe('register', () => {
     expect(screen.getByText(/your account was created/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent('internal error')
     expect(screen.queryByText(/3 to 32 characters/i)).toBeNull() // back on the login form
+  })
+})
+
+describe('another tab of the same browser logs in as someone else (the cookie is shared)', () => {
+  const heartbeats = () => calls.filter((c) => c.path === '/api/workspace/heartbeat').length
+  const meCalls = () => calls.filter((c) => c.path === '/api/me').length
+  const header = () => within(screen.getByRole('banner')).getByText(/^(alice|bob)$/).textContent
+
+  it('the first status answer is for another account: start over from /api/me, no panes for the old user', async () => {
+    // /api/me says alice at load; by the time the workspace is asked, the cookie belongs to bob.
+    let whoAmI = 'alice'
+    handlers['GET /api/me'] = () => {
+      const user = whoAmI
+      whoAmI = 'bob'
+      return json(200, ME_OF(user))
+    }
+    handlers['GET /api/workspace'] = () => json(200, RUNNING('bob'))
+    handlers['POST /api/workspace/heartbeat'] = () => new Response(null, { status: 204 })
+    await boot()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(meCalls()).toBe(2)
+    expect(header()).toBe('bob')
+    expect(mounted).toEqual(['bob']) // never a terminal under alice's name
+    expect(screen.getByTestId('terminal')).toHaveAttribute('data-user', 'bob')
+    expect(heartbeats()).toBe(1) // bob's page, once
+  })
+
+  it('a later poll answers for another account: the page for the old user goes, the new user gets his own', async () => {
+    let whoAmI = 'alice'
+    handlers['GET /api/me'] = () => json(200, ME_OF(whoAmI))
+    handlers['GET /api/workspace'] = () => json(200, RUNNING(whoAmI))
+    handlers['POST /api/workspace/heartbeat'] = () => new Response(null, { status: 204 })
+    await boot()
+    expect(header()).toBe('alice')
+    expect(mounted).toEqual(['alice'])
+
+    whoAmI = 'bob' // in the other tab
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(meCalls()).toBe(2)
+    expect(header()).toBe('bob')
+    expect(mounted).toEqual(['alice', 'bob'])
+    expect(screen.getAllByTestId('terminal')).toHaveLength(1)
+    expect(screen.getByTestId('terminal')).toHaveAttribute('data-user', 'bob')
+  })
+
+  it('and when nobody is logged in any more, the login page', async () => {
+    let loggedIn = true
+    handlers['GET /api/me'] = () => (loggedIn ? json(200, ME_OF('alice')) : json(401, { error: 'not logged in' }))
+    handlers['GET /api/workspace'] = () => json(200, RUNNING(loggedIn ? 'alice' : 'bob'))
+    handlers['POST /api/workspace/heartbeat'] = () => new Response(null, { status: 204 })
+    await boot()
+    loggedIn = false // the cookie now belongs to somebody whose session /api/me no longer accepts
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(screen.getByRole('button', { name: 'Log in' })).toBeInTheDocument()
+    expect(screen.queryByTestId('terminal')).toBeNull()
+  })
+
+  it('Power on answered for another account is not acted on', async () => {
+    let whoAmI = 'alice'
+    handlers['GET /api/me'] = () => json(200, ME_OF(whoAmI))
+    handlers['GET /api/workspace'] = () => json(200, { username: whoAmI, workspace: STOPPED.workspace })
+    handlers['POST /api/workspace/start'] = () => {
+      whoAmI = 'bob' // the cookie changed between the page load and the click
+      return json(200, { username: 'bob', workspace: { ...STOPPED.workspace, state: 'starting', neko_password: 'pw' } })
+    }
+    await boot()
+    expect(header()).toBe('alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Power on' }))
+    await flush()
+    await flush()
+    expect(meCalls()).toBe(2)
+    expect(header()).toBe('bob')
+    expect(screen.queryByRole('heading', { name: /starting your workspace/i })).toBeNull()
   })
 })

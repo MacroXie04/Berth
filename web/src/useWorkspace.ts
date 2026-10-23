@@ -29,6 +29,13 @@ function isVisible(): boolean {
   return typeof document === 'undefined' || document.visibilityState !== 'hidden'
 }
 
+/** Who the page was opened for, and what to do when the server answers for somebody else. */
+export interface Identity {
+  username: string
+  /** Another tab logged in as another user: the page must start over (App: back to the boot flow). */
+  onMismatch(): void
+}
+
 /**
  * Keeps the workspace status fresh and the user's activity known to the server.
  *
@@ -36,12 +43,22 @@ function isVisible(): boolean {
  *   then polls: every 2 s while starting, every 10 s while running, not at all
  *   while offline/stopped. One request at a time (a timer chain, not an
  *   interval): a status call on a running workspace takes about a second.
+ *   While a request has failed it asks every 5 s, whatever the state.
  * - Sends POST /api/workspace/heartbeat every 30 s while the workspace is
  *   starting or running AND the tab is visible, and once when that becomes true.
- * - Answers to requests that were overtaken by a Power on/off are dropped.
+ * - Stale answers are dropped: one that was overtaken by a Power on/off
+ *   (`epoch`), and one for which a newer status request was issued meanwhile
+ *   (`refreshSeq`: a tab that becomes visible asks at once, even if the timer's
+ *   request is still on its way, and the two may answer in either order).
+ * - Every answer carries the account it was for. The cookie is shared by all
+ *   tabs of the browser, so a tab that was opened for alice keeps talking to
+ *   whoever logged in last. When `identity` is given and the answer is for
+ *   someone else, nothing is applied, the status is cleared (the panes and the
+ *   heartbeat stop) and `identity.onMismatch` is called. An answer without a
+ *   username (an older backend) is taken as it is.
  * - Everything stops on unmount.
  */
-export function useWorkspace(api: Api): WorkspaceController {
+export function useWorkspace(api: Api, identity?: Identity): WorkspaceController {
   const [status, setStatus] = useState<WorkspaceStatus | null>(null)
   const [busy, setBusy] = useState<Busy>(null)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -51,8 +68,14 @@ export function useWorkspace(api: Api): WorkspaceController {
 
   const alive = useRef(true)
   const epoch = useRef(0) // bumped by every action: older poll answers are stale
+  const refreshSeq = useRef(0) // numbers the status requests: only the newest one's answer counts
   const busyRef = useRef<Busy>(null)
   const authLost = useRef(false)
+  const identityLost = useRef(false)
+  const identityRef = useRef(identity)
+  useEffect(() => {
+    identityRef.current = identity
+  })
 
   useEffect(() => {
     alive.current = true
@@ -61,25 +84,39 @@ export function useWorkspace(api: Api): WorkspaceController {
     }
   }, [])
 
+  // True when `s` is the answer for another account; the page has then been told and the status dropped.
+  const foreign = useCallback((s: WorkspaceStatus): boolean => {
+    const id = identityRef.current
+    if (!id || s.username === undefined || s.username === id.username) return false
+    identityLost.current = true
+    setStatus(null)
+    setPollError(null)
+    id.onMismatch()
+    return true
+  }, [])
+
   const refresh = useCallback(async () => {
-    if (authLost.current) return
+    if (authLost.current || identityLost.current) return
     const mine = epoch.current
+    const seq = ++refreshSeq.current
+    const current = () => alive.current && mine === epoch.current && seq === refreshSeq.current
     try {
       const s = await api.workspace()
-      if (!alive.current || mine !== epoch.current) return
+      if (!current()) return
+      if (foreign(s)) return
       setStatus(s)
       setPollError(null)
     } catch (err) {
-      if (!alive.current || mine !== epoch.current) return
+      if (!current()) return
       if (err instanceof ApiError && err.status === 401) {
         authLost.current = true // the app is about to show the login page
         return
       }
       setPollError(err instanceof ApiError ? err.message : 'Could not read the workspace status.')
     } finally {
-      if (alive.current && mine === epoch.current) setTick((t) => t + 1)
+      if (current()) setTick((t) => t + 1)
     }
-  }, [api])
+  }, [api, foreign])
 
   // Tab visibility.
   useEffect(() => {
@@ -95,13 +132,14 @@ export function useWorkspace(api: Api): WorkspaceController {
 
   // Next poll. `tick` changes after every finished request, which re-arms this.
   const state = status?.state ?? null
+  const failing = pollError !== null
   useEffect(() => {
     if (!visible || busy !== null) return
-    const delay = pollDelay(state)
+    const delay = pollDelay(state, failing)
     if (delay === null) return
     const t = setTimeout(() => void refresh(), delay)
     return () => clearTimeout(t)
-  }, [tick, visible, busy, state, refresh])
+  }, [tick, visible, busy, state, failing, refresh])
 
   // Heartbeat.
   const beat = heartbeatActive(state, visible, busy)
@@ -119,7 +157,7 @@ export function useWorkspace(api: Api): WorkspaceController {
 
   const run = useCallback(
     async (kind: Exclude<Busy, null>, call: () => Promise<WorkspaceStatus>, describe: (e: unknown) => string) => {
-      if (busyRef.current !== null) return
+      if (busyRef.current !== null || identityLost.current) return
       busyRef.current = kind
       epoch.current++
       setBusy(kind)
@@ -127,7 +165,10 @@ export function useWorkspace(api: Api): WorkspaceController {
       let failed = false
       try {
         const s = await call()
-        if (alive.current) setStatus(s)
+        if (alive.current && !foreign(s)) {
+          setStatus(s)
+          setPollError(null) // a fresh answer: whatever failed before is history
+        }
       } catch (err) {
         failed = true
         if (alive.current && !(err instanceof ApiError && err.status === 401)) setActionError(describe(err))
@@ -142,7 +183,7 @@ export function useWorkspace(api: Api): WorkspaceController {
       // After a failure the truth is on the server (busy, or still running).
       if (failed && alive.current) void refresh()
     },
-    [refresh],
+    [refresh, foreign],
   )
 
   const powerOn = useCallback(() => void run('starting', api.start, startErrorMessage), [run, api])

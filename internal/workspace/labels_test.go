@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -20,14 +21,14 @@ func TestLabelsForAUser(t *testing.T) {
 
 		"traefik.http.routers.alice-term.entrypoints":                    "web",
 		"traefik.http.routers.alice-term.rule":                           "PathPrefix(`/ws/alice/terminal`)",
-		"traefik.http.routers.alice-term.middlewares":                    "berth-auth@file,alice-term-strip",
+		"traefik.http.routers.alice-term.middlewares":                    "berth-auth@file,berth-ws-headers@file,alice-term-strip",
 		"traefik.http.routers.alice-term.service":                        "alice-term",
 		"traefik.http.middlewares.alice-term-strip.stripprefix.prefixes": "/ws/alice/terminal",
 		"traefik.http.services.alice-term.loadbalancer.server.port":      "7681",
 
 		"traefik.http.routers.alice-browser.entrypoints":               "web",
 		"traefik.http.routers.alice-browser.rule":                      "PathPrefix(`/ws/alice/browser`)",
-		"traefik.http.routers.alice-browser.middlewares":               "berth-auth@file",
+		"traefik.http.routers.alice-browser.middlewares":               "berth-auth@file,berth-ws-headers@file",
 		"traefik.http.routers.alice-browser.service":                   "alice-browser",
 		"traefik.http.services.alice-browser.loadbalancer.server.port": "8080",
 	}
@@ -44,29 +45,54 @@ func TestLabelsForAUser(t *testing.T) {
 }
 
 // The order of `middlewares` is load-bearing: ForwardAuth sees the URL as it is
-// when it runs, so it must run before StripPrefix.
-func TestAuthRunsBeforeStripPrefix(t *testing.T) {
+// when it runs, so it must run before StripPrefix, and the response-header
+// middleware sits between them (after the auth check, before the URL is
+// rewritten).
+func TestMiddlewareOrder(t *testing.T) {
 	l := Labels("alice", "berth-net-alice", "web")
+	// The literal middleware names, not the constants: they are what dynamic.yml
+	// defines and what Traefik resolves.
 	chain := strings.Split(l["traefik.http.routers.alice-term.middlewares"], ",")
-	if len(chain) != 2 || chain[0] != AuthMiddleware || !strings.Contains(chain[1], "strip") {
-		t.Fatalf("terminal middleware chain = %v", chain)
+	if len(chain) != 3 || chain[0] != "berth-auth@file" || chain[1] != "berth-ws-headers@file" || chain[2] != "alice-term-strip" {
+		t.Fatalf("terminal middleware chain = %v, want [berth-auth@file berth-ws-headers@file alice-term-strip]", chain)
 	}
-	// Neither router may exist without the auth middleware.
-	for k, v := range l {
-		if strings.HasSuffix(k, ".middlewares") && !strings.HasPrefix(v, AuthMiddleware) {
-			t.Errorf("%s = %q does not start with the auth middleware", k, v)
-		}
+	chain = strings.Split(l["traefik.http.routers.alice-browser.middlewares"], ",")
+	if len(chain) != 2 || chain[0] != "berth-auth@file" || chain[1] != "berth-ws-headers@file" {
+		t.Fatalf("browser middleware chain = %v, want [berth-auth@file berth-ws-headers@file]", chain)
 	}
-	// Every router that is declared has middlewares declared.
+	if AuthMiddleware != "berth-auth@file" || WSHeadersMiddleware != "berth-ws-headers@file" {
+		t.Errorf("middleware constants = %q, %q", AuthMiddleware, WSHeadersMiddleware)
+	}
+
+	// Every router that is declared has middlewares declared, starts with the
+	// auth check and carries the response headers: neither may exist without them.
 	routers := map[string]bool{}
 	for k := range l {
 		if rest, ok := strings.CutPrefix(k, "traefik.http.routers."); ok {
 			routers[strings.SplitN(rest, ".", 2)[0]] = true
 		}
 	}
+	if len(routers) != 2 {
+		t.Errorf("routers = %v, want the terminal and the browser router", routers)
+	}
 	for r := range routers {
-		if _, ok := l["traefik.http.routers."+r+".middlewares"]; !ok {
+		mw, ok := l["traefik.http.routers."+r+".middlewares"]
+		if !ok {
 			t.Errorf("router %s has no middlewares", r)
+			continue
+		}
+		list := strings.Split(mw, ",")
+		if list[0] != AuthMiddleware {
+			t.Errorf("router %s middlewares %q do not start with the auth middleware", r, mw)
+		}
+		if !slices.Contains(list, WSHeadersMiddleware) {
+			t.Errorf("router %s middlewares %q lack the response-header middleware", r, mw)
+		}
+		// The strip middleware, where there is one, comes last: it rewrites the URL.
+		for i, name := range list {
+			if strings.HasSuffix(name, "-strip") && i != len(list)-1 {
+				t.Errorf("router %s: %s is not the last middleware: %q", r, name, mw)
+			}
 		}
 	}
 }
@@ -154,21 +180,55 @@ func TestNekoEnv(t *testing.T) {
 }
 
 // One port per workspace (the default) is multiplexed over, not a one-port range.
+// The assertions use the literal environment strings, not the constants: the
+// names are neko's, and a typo in a constant would otherwise go unnoticed while
+// neko ignored the setting and used unpublished ephemeral UDP ports (video that
+// never connects for a browser off the host).
 func TestNekoEnvOnePortUsesTheMultiplexer(t *testing.T) {
 	cfg := testConfig()
-	env := nekoEnv(cfg, "alice", "u", "a", 30005, 30005)
-	if v := envValue(env, envNekoUDPMux); v != "30005" {
-		t.Errorf("UDPMUX = %q, want 30005", v)
+	env := nekoEnv(cfg, "alice", "userpw", "adminpw", 30005, 30005)
+	sort.Strings(env)
+	want := []string{
+		"NEKO_DESKTOP_SCREEN=1280x720@30",
+		"NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=adminpw",
+		"NEKO_MEMBER_MULTIUSER_USER_PASSWORD=userpw",
+		"NEKO_SERVER_METRICS=false",
+		"NEKO_SERVER_PATH_PREFIX=/ws/alice/browser",
+		"NEKO_SERVER_PROXY=true",
+		"NEKO_SESSION_IMPLICIT_HOSTING=true",
+		"NEKO_WEBRTC_UDPMUX=30005",
 	}
-	if v := envValue(env, envNekoEPR); v != "" {
-		t.Errorf("EPR = %q; a single port must use the multiplexer, not a range", v)
+	if strings.Join(env, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("env:\n%s\nwant:\n%s", strings.Join(env, "\n"), strings.Join(want, "\n"))
 	}
+	for _, e := range env {
+		if strings.HasPrefix(e, "NEKO_WEBRTC_EPR") {
+			t.Errorf("%s: a single port must use the multiplexer, not a range", e)
+		}
+	}
+
+	// With a public IP the NAT setting joins it, under neko's literal name.
+	cfg.PublicIP = "203.0.113.7"
+	env = nekoEnv(cfg, "alice", "u", "a", 30005, 30005)
+	if !slices.Contains(env, "NEKO_WEBRTC_UDPMUX=30005") || !slices.Contains(env, "NEKO_WEBRTC_NAT1TO1=203.0.113.7") {
+		t.Errorf("env %v lacks NEKO_WEBRTC_UDPMUX=30005 or NEKO_WEBRTC_NAT1TO1=203.0.113.7", env)
+	}
+
 	// Two ports or more: a range, no multiplexer.
 	env = nekoEnv(cfg, "alice", "u", "a", 30005, 30006)
-	if v := envValue(env, envNekoEPR); v != "30005-30006" {
-		t.Errorf("EPR = %q, want 30005-30006", v)
+	if !slices.Contains(env, "NEKO_WEBRTC_EPR=30005-30006") {
+		t.Errorf("env %v lacks NEKO_WEBRTC_EPR=30005-30006", env)
 	}
-	if v := envValue(env, envNekoUDPMux); v != "" {
-		t.Errorf("UDPMUX = %q for a range", v)
+	for _, e := range env {
+		if strings.HasPrefix(e, "NEKO_WEBRTC_UDPMUX") {
+			t.Errorf("%s set for a range", e)
+		}
+	}
+
+	// No block (the zero values): neither setting.
+	for _, e := range nekoEnv(cfg, "alice", "u", "a", 0, 0) {
+		if strings.HasPrefix(e, "NEKO_WEBRTC_UDPMUX") || strings.HasPrefix(e, "NEKO_WEBRTC_EPR") {
+			t.Errorf("%s set without a port block", e)
+		}
 	}
 }

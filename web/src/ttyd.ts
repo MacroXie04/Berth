@@ -139,10 +139,22 @@ export function decodeServerMessage(data: ArrayBuffer | Uint8Array | string, str
 }
 
 /**
- * ttyd's flow control, so `cat bigfile` cannot make the page fall behind
- * without bound: after every `limit` bytes the write is tracked with a
- * callback; more than `highWater` outstanding writes -> PAUSE the server, and
- * once xterm has caught up to below `lowWater` -> RESUME.
+ * The client half of ttyd's flow control: after every `limit` bytes the write
+ * to the terminal is tracked with a completion callback; once more than
+ * `highWater` tracked writes are outstanding the client sends PAUSE, and once
+ * xterm has caught up to below `lowWater` it sends RESUME.
+ *
+ * What this does NOT do: ttyd 1.7.7 (the version in the workspace image)
+ * ignores PAUSE and RESUME (its `paused` flag is set once, when the shell is
+ * spawned, and never changed; measured: PAUSE, then 6 MB of output, all of it
+ * arrives at once). A page that renders slower than the output arrives
+ * therefore is NOT throttled by the server. What keeps such a page alive is
+ * elsewhere: the image starts ttyd with `--ping-interval 30` (ttyd drops a
+ * client that has not answered a ping within twice that; its default hangs up
+ * on a busy page after 10 s and the reconnect would start a new shell), and
+ * `TtydSession` survives xterm refusing a write when its queue is over its cap
+ * ("write data discarded"). The two commands stay because they are the
+ * protocol: a ttyd that honours them gets the throttling for free.
  */
 export class FlowControl {
   private written = 0

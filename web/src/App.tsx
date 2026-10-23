@@ -82,6 +82,7 @@ export function App() {
           api={api}
           username={screen.user.username}
           onLoggedOut={() => setScreen({ kind: 'anon', notice: null })}
+          onIdentityChanged={() => void boot()}
         />
       )
   }

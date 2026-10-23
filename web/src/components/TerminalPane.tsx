@@ -1,39 +1,19 @@
-import { FitAddon } from '@xterm/addon-fit'
-import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
-import { useEffect, useRef, useState } from 'react'
+import type { Terminal } from '@xterm/xterm'
+import { useEffect, useId, useRef, useState } from 'react'
+import { LEAVE_HINT, createTerminal } from '../terminal'
 import { terminalUrl } from '../ttyd'
 import { TtydSession, type SessionState } from '../ttydSession'
-
-// A dark theme in both color schemes: it reads well on a light page too.
-const THEME = {
-  background: '#14171f',
-  foreground: '#d7dce5',
-  cursor: '#d7dce5',
-  cursorAccent: '#14171f',
-  selectionBackground: '#3a4a6b',
-  black: '#1c2029',
-  red: '#e06c75',
-  green: '#98c379',
-  yellow: '#e5c07b',
-  blue: '#61afef',
-  magenta: '#c678dd',
-  cyan: '#56b6c2',
-  white: '#abb2bf',
-  brightBlack: '#5c6370',
-  brightRed: '#ef8a93',
-  brightGreen: '#b1d98f',
-  brightYellow: '#f0d08f',
-  brightBlue: '#7fc0fa',
-  brightMagenta: '#d68ef0',
-  brightCyan: '#74cfdb',
-  brightWhite: '#e6e9ef',
-}
 
 const FIT_DEBOUNCE_MS = 60
 
 interface Props {
   username: string
+  /**
+   * Shift+Escape in the terminal: focus must go somewhere (the page puts it on
+   * the pane divider). Without it the terminal just gives up focus.
+   */
+  onLeave?: () => void
 }
 
 /**
@@ -41,7 +21,12 @@ interface Props {
  * It only exists while the workspace is running; unmounting closes the socket,
  * so a power-off never turns into a reconnect loop.
  */
-export function TerminalPane({ username }: Props) {
+export function TerminalPane({ username, onLeave }: Props) {
+  const hintId = useId()
+  const onLeaveRef = useRef(onLeave)
+  useEffect(() => {
+    onLeaveRef.current = onLeave
+  })
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const sessionRef = useRef<TtydSession | null>(null)
@@ -52,16 +37,10 @@ export function TerminalPane({ username }: Props) {
     const host = hostRef.current
     if (!host) return
 
-    const term = new Terminal({
-      cursorBlink: true,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
-      fontSize: 14,
-      scrollback: 5000,
-      theme: THEME,
-    })
-    const fit = new FitAddon()
-    term.loadAddon(fit)
+    const { term, fit } = createTerminal(() => onLeaveRef.current?.())
     term.open(host)
+    // The keyboard hint is part of what a screen reader announces for the input.
+    term.textarea?.setAttribute('aria-describedby', hintId)
     termRef.current = term
 
     const doFit = () => {
@@ -127,12 +106,12 @@ export function TerminalPane({ username }: Props) {
       termRef.current = null
       term.dispose()
     }
-  }, [username])
+  }, [username, hintId])
 
   const connected = state.status === 'open'
 
   return (
-    <section className="pane pane--terminal" aria-label="Terminal">
+    <section className="pane pane--terminal" aria-label="Terminal" aria-describedby={hintId}>
       <div className="pane__bar">
         <span className="pane__title">Terminal</span>
         {title && (
@@ -140,6 +119,9 @@ export function TerminalPane({ username }: Props) {
             {title}
           </span>
         )}
+        <span id={hintId} className="pane__hint" title={LEAVE_HINT}>
+          {LEAVE_HINT}
+        </span>
       </div>
       <div className="pane__body" onClick={() => termRef.current?.focus()}>
         <div ref={hostRef} className="term-host" />

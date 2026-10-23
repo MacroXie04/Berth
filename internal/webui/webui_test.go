@@ -295,6 +295,113 @@ func TestConditionalRequests(t *testing.T) {
 	}
 }
 
+// A 206 would be compressed by Traefik's compress middleware (br, zstd) while its
+// Content-Range counts identity bytes, which corrupts a resumed download. The
+// handler never answers one: every request for a file is a 200 or a 304.
+func TestRangeRequestsAreAnsweredWithTheWholeFile(t *testing.T) {
+	h := newHandler(t, fixture())
+	files := map[string]string{
+		"/assets/index-Abc12345.js":  "console.log(1)",
+		"/assets/index-Abc12345.css": "body{}",
+		"/index.html":                indexHTML,
+		"/":                          indexHTML, // the app shell
+		"/workspace/deep/link":       indexHTML, // a client-side route, same file
+		"/favicon.ico":               "ico",
+	}
+	ranges := []string{"bytes=0-3", "bytes=1-", "bytes=-4", "bytes=0-0", "bytes=0-1,3-4", "bytes=999999-", "bytes=0-99999", "items=0-3", "bytes=garbage"}
+	for p, body := range files {
+		etag := do(h, "GET", p).Header().Get("ETag")
+		for _, rg := range ranges {
+			for _, ifRange := range []string{"", etag, `"stale"`} {
+				req := httptest.NewRequest("GET", p, nil)
+				req.Header.Set("Range", rg)
+				if ifRange != "" {
+					req.Header.Set("If-Range", ifRange)
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				what := "GET " + p + " Range: " + rg + " If-Range: " + ifRange
+				if rec.Code != 200 {
+					t.Errorf("%s: %d, want 200", what, rec.Code)
+				}
+				if rec.Body.String() != body {
+					t.Errorf("%s: body %q, want the whole file %q", what, rec.Body.String(), body)
+				}
+				if cr := rec.Header().Get("Content-Range"); cr != "" {
+					t.Errorf("%s: Content-Range %q", what, cr)
+				}
+				if ct := rec.Header().Get("Content-Type"); strings.HasPrefix(ct, "multipart/") {
+					t.Errorf("%s: Content-Type %q", what, ct)
+				}
+				if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(len(body)) {
+					t.Errorf("%s: Content-Length %q, want %d", what, cl, len(body))
+				}
+				if ar := rec.Header().Get("Accept-Ranges"); ar != "none" {
+					t.Errorf("%s: Accept-Ranges %q, want none (ranges are not served)", what, ar)
+				}
+				if rec.Header().Get("ETag") != etag {
+					t.Errorf("%s: ETag %q, want %q", what, rec.Header().Get("ETag"), etag)
+				}
+				checkSecurityHeaders(t, what, rec.Header())
+				// The handler works on a copy: the caller's request is untouched.
+				if req.Header.Get("Range") != rg || req.Header.Get("If-Range") != ifRange {
+					t.Errorf("%s: the caller's request headers were modified", what)
+				}
+			}
+		}
+	}
+
+	// Without a Range header too: no ranges are advertised.
+	if ar := do(h, "GET", "/assets/index-Abc12345.js").Header().Get("Accept-Ranges"); ar != "none" {
+		t.Errorf("Accept-Ranges %q without a Range request, want none", ar)
+	}
+
+	// HEAD keeps working: the whole file's headers and no body.
+	for _, rg := range []string{"", "bytes=0-3"} {
+		req := httptest.NewRequest("HEAD", "/assets/index-Abc12345.js", nil)
+		if rg != "" {
+			req.Header.Set("Range", rg)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 || rec.Body.Len() != 0 || rec.Header().Get("Content-Range") != "" ||
+			rec.Header().Get("Content-Length") != strconv.Itoa(len("console.log(1)")) {
+			t.Errorf("HEAD with Range %q: %d body=%q Content-Range=%q Content-Length=%q",
+				rg, rec.Code, rec.Body.String(), rec.Header().Get("Content-Range"), rec.Header().Get("Content-Length"))
+		}
+	}
+
+	// Validators still win: a matching If-None-Match is a 304 even with a Range.
+	for _, p := range []string{"/", "/assets/index-Abc12345.js"} {
+		etag := do(h, "GET", p).Header().Get("ETag")
+		req := httptest.NewRequest("GET", p, nil)
+		req.Header.Set("If-None-Match", etag)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 304 || rec.Body.Len() != 0 || rec.Header().Get("Content-Range") != "" {
+			t.Errorf("GET %s with If-None-Match and Range: %d %q", p, rec.Code, rec.Body.String())
+		}
+		checkSecurityHeaders(t, "304+Range "+p, rec.Header())
+	}
+
+	// Over a real connection, the way Traefik talks to the backend.
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	creq, _ := http.NewRequest("GET", srv.URL+"/assets/index-Abc12345.js", nil)
+	creq.Header.Set("Range", "bytes=5-")
+	creq.Header.Set("Accept-Encoding", "br")
+	resp, err := http.DefaultClient.Do(creq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(got) != "console.log(1)" || resp.Header.Get("Content-Range") != "" {
+		t.Errorf("ranged request over HTTP: %d %q Content-Range=%q", resp.StatusCode, got, resp.Header.Get("Content-Range"))
+	}
+}
+
 // Without a build the API still runs; the app shell answers 503 and says why.
 func TestFrontendNotBuilt(t *testing.T) {
 	for name, fsys := range map[string]fstest.MapFS{

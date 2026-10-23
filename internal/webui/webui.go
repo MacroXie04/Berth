@@ -255,8 +255,25 @@ func (h *handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 		}
 		rs = bytes.NewReader(data)
 	}
+	// Never a 206. Traefik's compress middleware (docker-compose.yml, berth-web)
+	// would encode the partial body with br or zstd while Content-Range still
+	// counts identity bytes, so a resumed download would be corrupt. The whole
+	// bundle is a few hundred kilobytes: every answer is a 200 or a 304 (and
+	// Accept-Ranges says so). The caller's request keeps its headers.
+	r = r.Clone(r.Context())
+	r.Header.Del("Range")
+	r.Header.Del("If-Range")
 	// No modification time: the ETag does the validation.
-	http.ServeContent(w, r, name, time.Time{}, rs)
+	http.ServeContent(noRanges{w}, r, name, time.Time{}, rs)
+}
+
+// noRanges replaces the Accept-Ranges: bytes that http.ServeContent always
+// advertises: this handler does not serve ranges.
+type noRanges struct{ http.ResponseWriter }
+
+func (w noRanges) WriteHeader(code int) {
+	w.Header().Set("Accept-Ranges", "none")
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func plain(w http.ResponseWriter, r *http.Request, status int, msg string) {

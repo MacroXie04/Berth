@@ -4,8 +4,28 @@ import { ApiError, type Api } from './api'
 import type { Health, WorkspaceState, WorkspaceStatus } from './types'
 import { useWorkspace } from './useWorkspace'
 
-function ws(state: WorkspaceState, health: Health = 'none'): WorkspaceStatus {
-  return { state, health, mem_limit_mb: 2048, cpu_limit: 2, last_active_at: null, last_stopped_at: null, usage: null }
+function ws(state: WorkspaceState, health: Health = 'none', username?: string): WorkspaceStatus {
+  return {
+    state,
+    health,
+    mem_limit_mb: 2048,
+    cpu_limit: 2,
+    last_active_at: null,
+    last_stopped_at: null,
+    usage: null,
+    ...(username === undefined ? {} : { username }),
+  }
+}
+
+/** A promise the test settles by hand. */
+function deferred<T>() {
+  let resolve!: (v: T) => void
+  let reject!: (e: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
 interface Mock {
@@ -352,5 +372,267 @@ describe('Power on / Power off', () => {
     await advance(0)
     await act(async () => result.current.powerOn())
     expect(result.current.actionError).toBeNull()
+  })
+})
+
+describe('a failed status request is retried until it works, whatever the state', () => {
+  const down = () => new ApiError(0, 'Cannot reach the server. Check your connection.')
+
+  it('a stopped workspace whose tab is shown again while the network is down: retries every 5 s, then stops asking', async () => {
+    const m = mockApi(ws('stopped'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(1)
+    act(() => setVisibility('hidden'))
+    m.workspace.mockRejectedValue(down())
+    act(() => setVisibility('visible'))
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(2)
+    expect(result.current.pollError).toMatch(/cannot reach/i)
+    expect(result.current.status?.state).toBe('stopped')
+
+    await advance(4_900)
+    expect(m.workspace).toHaveBeenCalledTimes(2)
+    await advance(100)
+    expect(m.workspace).toHaveBeenCalledTimes(3) // 5 s after the failure
+    await advance(5_000)
+    expect(m.workspace).toHaveBeenCalledTimes(4) // and again, as long as it fails
+
+    m.workspace.mockImplementation(async () => ws('stopped'))
+    await advance(5_000)
+    expect(m.workspace).toHaveBeenCalledTimes(5)
+    expect(result.current.pollError).toBeNull()
+    await advance(120_000)
+    expect(m.workspace).toHaveBeenCalledTimes(5) // healthy and stopped again: nothing to poll
+  })
+
+  it('an offline workspace is retried too', async () => {
+    const m = mockApi(ws('offline'))
+    m.workspace.mockRejectedValueOnce(down())
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    expect(result.current.status).toBeNull() // the very first request failed
+    await advance(2_000) // unknown state: the fast retry
+    expect(result.current.status?.state).toBe('offline')
+    m.workspace.mockRejectedValueOnce(down())
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible'))
+    await advance(0)
+    expect(result.current.pollError).not.toBeNull()
+    await advance(5_000)
+    expect(result.current.pollError).toBeNull()
+  })
+
+  it('a running workspace is asked again after 5 s instead of 10 s while the last answer failed', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    m.workspace.mockRejectedValueOnce(down())
+    await advance(10_000)
+    expect(result.current.pollError).not.toBeNull()
+    await advance(5_000)
+    expect(result.current.pollError).toBeNull()
+  })
+
+  it('a failed Power on whose status re-read fails too keeps asking', async () => {
+    const m = mockApi(ws('offline'))
+    m.start.mockRejectedValue(new ApiError(503, 'the server has no capacity for another workspace'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    m.workspace.mockRejectedValue(down())
+    await act(async () => result.current.powerOn())
+    await advance(0)
+    expect(result.current.pollError).not.toBeNull()
+    const n = m.workspace.mock.calls.length
+    await advance(5_000)
+    expect(m.workspace.mock.calls.length).toBe(n + 1)
+    m.workspace.mockImplementation(async () => ws('offline'))
+    await advance(5_000)
+    expect(result.current.pollError).toBeNull()
+  })
+
+  it('a fresh answer from Power off clears the "not up to date" flag of an earlier failed poll', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    m.workspace.mockRejectedValueOnce(down())
+    await advance(10_000)
+    expect(result.current.pollError).not.toBeNull()
+    await act(async () => result.current.powerOff())
+    expect(result.current.status?.state).toBe('stopped')
+    expect(result.current.pollError).toBeNull()
+    await advance(120_000)
+    expect(result.current.pollError).toBeNull() // and nothing polls a stopped workspace into a new error
+  })
+})
+
+describe('status answers that arrive out of order', () => {
+  it('two overlapping requests: the older answer does not overwrite the newer one', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    const timerPoll = deferred<WorkspaceStatus>()
+    const shownAgain = deferred<WorkspaceStatus>()
+    m.workspace.mockImplementationOnce(() => timerPoll.promise).mockImplementationOnce(() => shownAgain.promise)
+    await advance(10_000) // the timer's request is under way ...
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible')) // ... and the tab coming back asks again
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(3)
+    await act(async () => shownAgain.resolve(ws('stopped')))
+    expect(result.current.status?.state).toBe('stopped')
+    await act(async () => timerPoll.resolve(ws('running', 'healthy'))) // older, answered last
+    expect(result.current.status?.state).toBe('stopped')
+    await advance(60_000)
+    expect(result.current.status?.state).toBe('stopped')
+  })
+
+  it('an older failure does not flag a newer success as "not up to date"', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    const timerPoll = deferred<WorkspaceStatus>()
+    m.workspace.mockImplementationOnce(() => timerPoll.promise)
+    await advance(10_000)
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible'))
+    await advance(0)
+    expect(result.current.pollError).toBeNull()
+    await act(async () => timerPoll.reject(new ApiError(0, 'Cannot reach the server. Check your connection.')))
+    expect(result.current.pollError).toBeNull()
+    expect(result.current.status?.state).toBe('running')
+  })
+
+  it('a request that was under way when Power on was pressed and answers before Power on does is dropped as well', async () => {
+    const m = mockApi(ws('stopped'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    const poll = deferred<WorkspaceStatus>()
+    m.workspace.mockImplementationOnce(() => poll.promise)
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible')) // a status request is on its way ...
+    await advance(0)
+    const start = deferred<WorkspaceStatus>()
+    m.start.mockImplementation(() => start.promise)
+    act(() => result.current.powerOn()) // ... and the user presses Power on
+    expect(result.current.busy).toBe('starting')
+    await act(async () => poll.resolve(ws('offline'))) // the request answers first, with what was true before the press
+    expect(result.current.status?.state).toBe('stopped') // not applied: the action's own answer decides
+    await act(async () => start.resolve(ws('starting')))
+    expect(result.current.status?.state).toBe('starting')
+  })
+
+  it('a request that started during Power off but is answered after it does not undo it', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    const stop = deferred<WorkspaceStatus>()
+    m.stop.mockImplementation(() => stop.promise)
+    act(() => result.current.powerOff())
+    expect(result.current.busy).toBe('stopping')
+    const late = deferred<WorkspaceStatus>()
+    m.workspace.mockImplementationOnce(() => late.promise)
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible')) // asks while the stop is still running
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(2)
+    await act(async () => stop.resolve(ws('stopped')))
+    expect(result.current.status?.state).toBe('stopped')
+    await act(async () => late.resolve(ws('running', 'healthy'))) // the answer of before the stop
+    expect(result.current.status?.state).toBe('stopped')
+    expect(result.current.busy).toBeNull()
+    await advance(60_000)
+    expect(result.current.status?.state).toBe('stopped')
+    expect(m.workspace).toHaveBeenCalledTimes(2) // and it did not re-arm a poll for a "running" workspace
+  })
+})
+
+describe('an answer for another account (another tab logged in as someone else)', () => {
+  function setupIdentity(initial: WorkspaceStatus) {
+    const m = mockApi(initial)
+    const onMismatch = vi.fn()
+    const hook = renderHook(() => useWorkspace(m.api, { username: 'alice', onMismatch }))
+    return { m, onMismatch, ...hook }
+  }
+
+  it('accepts answers for the page\'s own user', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('running', 'healthy', 'alice'))
+    await advance(0)
+    expect(result.current.status?.state).toBe('running')
+    expect(onMismatch).not.toHaveBeenCalled()
+    expect(m.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('accepts an answer without a username (an older backend)', async () => {
+    const { onMismatch, result } = setupIdentity(ws('running', 'healthy'))
+    await advance(0)
+    expect(result.current.status?.state).toBe('running')
+    expect(onMismatch).not.toHaveBeenCalled()
+  })
+
+  it('does nothing without an identity to check against', async () => {
+    const m = mockApi(ws('running', 'healthy', 'bob'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    expect(result.current.status?.state).toBe('running')
+  })
+
+  it('the first answer is for someone else: nothing is applied, no heartbeat, one call to onMismatch, no more polling', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('running', 'healthy', 'bob'))
+    await advance(0)
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+    expect(result.current.status).toBeNull()
+    await advance(120_000)
+    expect(m.heartbeat).not.toHaveBeenCalled()
+    expect(m.workspace).toHaveBeenCalledTimes(1)
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('a later poll answers for someone else: the status is dropped and the heartbeat stops', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('running', 'healthy', 'alice'))
+    await advance(0)
+    expect(m.heartbeat).toHaveBeenCalledTimes(1)
+    m.set(ws('running', 'healthy', 'bob'))
+    await advance(10_000)
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+    expect(result.current.status).toBeNull()
+    await advance(120_000)
+    expect(m.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('a Power on answered for someone else is not applied, and the page does not act again', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('stopped', 'none', 'alice'))
+    await advance(0)
+    m.start.mockResolvedValue(ws('starting', 'none', 'bob'))
+    await act(async () => result.current.powerOn())
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+    expect(result.current.status).toBeNull()
+    await act(async () => result.current.powerOn())
+    await act(async () => result.current.powerOff())
+    expect(m.start).toHaveBeenCalledTimes(1)
+    expect(m.stop).not.toHaveBeenCalled()
+  })
+
+  it('a Power off answered for someone else is not applied either', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('running', 'healthy', 'alice'))
+    await advance(0)
+    m.stop.mockResolvedValue(ws('stopped', 'none', 'bob'))
+    await act(async () => result.current.powerOff())
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+    expect(result.current.status).toBeNull()
+  })
+
+  it('an overtaken answer for someone else is just dropped (the newer answer decides)', async () => {
+    const { m, onMismatch, result } = setupIdentity(ws('running', 'healthy', 'alice'))
+    await advance(0)
+    const old = deferred<WorkspaceStatus>()
+    m.workspace.mockImplementationOnce(() => old.promise)
+    await advance(10_000)
+    act(() => setVisibility('hidden'))
+    act(() => setVisibility('visible'))
+    await advance(0) // the newer request answers for alice
+    await act(async () => old.resolve(ws('running', 'healthy', 'bob')))
+    expect(onMismatch).not.toHaveBeenCalled()
+    expect(result.current.status?.state).toBe('running')
   })
 })

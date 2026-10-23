@@ -283,6 +283,11 @@ form {
 .field input[aria-invalid='true'] {
   border-color: var(--danger);
 }
+/* Read-only while a request is under way (not disabled: it must keep taking focus). */
+.field input[aria-busy='true'] {
+  cursor: progress;
+  opacity: 0.75;
+}
 .field__hint {
   color: var(--muted);
   font-size: 0.85rem;
@@ -506,15 +511,16 @@ form {
 .split {
   flex: 1 1 0;
   display: flex;
+  flex-direction: row;
   position: relative;
   min-width: 0;
   min-height: 0;
 }
-.split--row {
-  flex-direction: row;
-}
-.split--column {
-  flex-direction: column;
+/* The same query as STACK_QUERY in components/SplitView.tsx (a test keeps them equal). */
+@media (max-width: 900px) and (min-height: 480px) {
+  .split {
+    flex-direction: column;
+  }
 }
 .split__pane {
   display: flex;
@@ -622,7 +628,18 @@ form {
   font-weight: 700;
 }
 .pane__sub {
+  /* Takes what is left over (and gives it up first): the keyboard hint after it matters more than the shell's title. */
+  flex: 1 1 0;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.pane__hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

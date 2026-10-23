@@ -19,6 +19,29 @@ http:
         # The check replies with a few bytes; refuse to read more than 4 KiB.
         maxResponseBodySize: 4096
 
+    # Response headers for everything served under /ws/ (ttyd, neko, and the
+    # catch-all below). Workspace routers list it right after berth-auth and
+    # before StripPrefix; it sits on the response path only, so it changes
+    # nothing about what the auth check sees. A header set here replaces the
+    # workspace's own, which is the point: the workspace is not trusted.
+    #
+    #  - Framing. SameSite=Lax does not stop a page on a sibling origin of the same
+    #    site (another port or subdomain) from framing the victim's live terminal
+    #    or remote browser with the victim's cookies. Only the Berth page itself
+    #    (same origin: the SPA frames neko) may frame them. Both forms are sent,
+    #    old browsers read X-Frame-Options, the rest frame-ancestors.
+    #  - Service workers. A workspace page could register a worker with scope "/"
+    #    by sending Service-Worker-Allowed: /, and a worker on "/" would outlive
+    #    the workspace, logout and the session and sit in front of the login page
+    #    and the app. An empty value deletes the header, which caps a worker's
+    #    scope at the directory of its script, i.e. under /ws/<user>/<section>/.
+    berth-ws-headers:
+      headers:
+        customFrameOptionsValue: SAMEORIGIN
+        contentSecurityPolicy: "frame-ancestors 'self'"
+        customResponseHeaders:
+          Service-Worker-Allowed: ""
+
   # Catch-all for /ws/. A workspace router exists only while its container is up
   # and healthy; for every other state or name Traefik would answer 404 before any
   # authentication ran, which tells an anonymous caller who has a workspace running
@@ -37,6 +60,7 @@ http:
       priority: 2
       middlewares:
         - berth-auth
+        - berth-ws-headers
       service: berth-ws-fallback
   services:
     berth-ws-fallback:
