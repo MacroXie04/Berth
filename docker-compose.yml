@@ -20,7 +20,10 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --providers.docker.network=berth-proxy
-      - --providers.file.filename=/etc/traefik/dynamic.yml
+      # A directory, not a file: Traefik watches it, so an update that replaces
+      # traefik/dynamic.yml (git pull does) is picked up. A single-file bind mount
+      # keeps the old inode and the running Traefik never sees the new content.
+      - --providers.file.directory=/etc/traefik/dynamic
       - --entrypoints.web.address=:80
       # Workspace URLs never contain these; refusing them at the edge removes a
       # class of router-vs-checker path confusion. (Path sanitising is already
@@ -44,7 +47,8 @@ services:
       # Root-equivalent access to the host. Read-only does not limit the Docker
       # API; it only prevents replacing the socket file.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      # Every *.yml in this directory is dynamic configuration: keep it to that.
+      - ./traefik:/etc/traefik/dynamic:ro
     networks:
       - berth-proxy
     healthcheck:

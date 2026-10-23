@@ -10,9 +10,10 @@ import (
 )
 
 // traefik/dynamic.yml is configuration the labels depend on: Traefik resolves
-// "berth-auth@file" and "berth-ws-headers@file" against it, and an unknown
-// middleware name makes it drop the whole router (a 404 that tells an anonymous
-// caller who has a workspace up). These tests read the real file.
+// "berth-auth@file" against it (a chain of the response headers and the
+// ForwardAuth check), and an unknown middleware name makes it drop the whole
+// router (a 404 that tells an anonymous caller who has a workspace up). These
+// tests read the real file.
 
 func loadDynamicConfig(t *testing.T) map[string]any {
 	t.Helper()
@@ -49,14 +50,12 @@ func TestDynamicConfigDefinesTheMiddlewaresTheLabelsUse(t *testing.T) {
 	cfg := loadDynamicConfig(t)
 	defined := get(t, cfg, "http", "middlewares").(map[string]any)
 
-	for _, ref := range []string{AuthMiddleware, WSHeadersMiddleware} {
-		name, ok := strings.CutSuffix(ref, "@file")
-		if !ok {
-			t.Fatalf("%q is not a file-provider reference", ref)
-		}
-		if _, ok := defined[name]; !ok {
-			t.Errorf("middleware %s is used by the labels but not defined in traefik/dynamic.yml (defined: %v)", ref, keys(defined))
-		}
+	name, ok := strings.CutSuffix(AuthMiddleware, "@file")
+	if !ok {
+		t.Fatalf("%q is not a file-provider reference", AuthMiddleware)
+	}
+	if _, ok := defined[name]; !ok {
+		t.Errorf("middleware %s is used by the labels but not defined in traefik/dynamic.yml (defined: %v)", AuthMiddleware, keys(defined))
 	}
 	// Every @file name any label mentions is defined.
 	for k, v := range Labels("alice", "n", "web") {
@@ -70,6 +69,30 @@ func TestDynamicConfigDefinesTheMiddlewaresTheLabelsUse(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// berth-auth is the one name every /ws/ router carries. It is a chain, headers
+// first: the response headers then also reach the 401 and 403 the ForwardAuth
+// check writes itself (a middleware listed after the check never sees those
+// responses), and no router can have the check without the headers. Each member
+// must exist, or Traefik drops the chain and every router that names it.
+func TestAuthMiddlewareIsAChainOfHeadersThenCheck(t *testing.T) {
+	cfg := loadDynamicConfig(t)
+	defined := get(t, cfg, "http", "middlewares").(map[string]any)
+	chain := get(t, cfg, "http", "middlewares", "berth-auth", "chain", "middlewares")
+	got, _ := chain.([]any)
+	want := []any{"berth-ws-headers", "berth-forward-auth"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("berth-auth chain = %v, want %v (headers first, so the check's own 401/403 carry them)", got, want)
+	}
+	for _, name := range got {
+		if _, ok := defined[name.(string)]; !ok {
+			t.Errorf("berth-auth chains %s, which dynamic.yml does not define", name)
+		}
+	}
+	if len(get(t, cfg, "http", "middlewares", "berth-auth").(map[string]any)) != 1 {
+		t.Errorf("berth-auth has settings besides chain: %v", get(t, cfg, "http", "middlewares", "berth-auth"))
 	}
 }
 
@@ -106,7 +129,7 @@ func TestWorkspaceResponseHeadersMiddleware(t *testing.T) {
 
 func TestForwardAuthMiddlewareSettings(t *testing.T) {
 	cfg := loadDynamicConfig(t)
-	fa := get(t, cfg, "http", "middlewares", "berth-auth", "forwardAuth").(map[string]any)
+	fa := get(t, cfg, "http", "middlewares", "berth-forward-auth", "forwardAuth").(map[string]any)
 	if fa["trustForwardHeader"] != "false" {
 		t.Errorf("trustForwardHeader = %v: a client must never choose the URI the check sees", fa["trustForwardHeader"])
 	}
@@ -119,14 +142,14 @@ func TestForwardAuthMiddlewareSettings(t *testing.T) {
 }
 
 // The catch-all for /ws/ answers every path whose router does not exist; it runs
-// the same check and carries the same response headers as a real workspace router.
+// the same chain (response headers, then the check) as a real workspace router.
 func TestFallbackRouterHasTheSameMiddlewares(t *testing.T) {
 	cfg := loadDynamicConfig(t)
 	r := get(t, cfg, "http", "routers", "berth-ws-fallback").(map[string]any)
 	got, _ := r["middlewares"].([]any)
-	want := []any{"berth-auth", "berth-ws-headers"}
+	want := []any{"berth-auth"}
 	if !slices.Equal(got, want) {
-		t.Errorf("berth-ws-fallback middlewares = %v, want %v (auth first, then the response headers)", got, want)
+		t.Errorf("berth-ws-fallback middlewares = %v, want %v (the same chain a workspace router uses)", got, want)
 	}
 	if r["rule"] != "PathPrefix(`/ws/`)" || r["priority"] != "2" {
 		t.Errorf("berth-ws-fallback rule=%v priority=%v", r["rule"], r["priority"])
@@ -134,7 +157,7 @@ func TestFallbackRouterHasTheSameMiddlewares(t *testing.T) {
 	// The labels name the same middlewares, with the @file suffix.
 	for _, name := range got {
 		ref := name.(string) + "@file"
-		if ref != AuthMiddleware && ref != WSHeadersMiddleware {
+		if ref != AuthMiddleware {
 			t.Errorf("fallback uses %s, which the labels do not", ref)
 		}
 	}

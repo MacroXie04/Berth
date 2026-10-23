@@ -474,7 +474,9 @@ func TestTraefikWorkspaceRoutes(t *testing.T) {
 		t.Errorf("catch-all 404: %d XFO=%q CSP=%q", r.status, r.header.Values("X-Frame-Options"), r.header.Values("Content-Security-Policy"))
 	}
 
-	// ForwardAuth's own 401/403 are untouched by the chain behind it.
+	// ForwardAuth's own 401/403 keep the backend's JSON body and no-store, and,
+	// because the headers sit before the check in the berth-auth chain, carry the
+	// framing headers too.
 	for _, tc := range []struct {
 		path, user string
 		want       int
@@ -483,6 +485,12 @@ func TestTraefikWorkspaceRoutes(t *testing.T) {
 		if r.status != tc.want || !strings.Contains(r.body, `"error"`) || r.header.Get("Cache-Control") != "no-store" {
 			t.Errorf("GET %s as %q: %d %q Cache-Control=%q, want the backend's %d JSON error with no-store",
 				tc.path, tc.user, r.status, r.body, r.header.Get("Cache-Control"), tc.want)
+		}
+		if got := r.header.Values("X-Frame-Options"); len(got) != 1 || got[0] != "SAMEORIGIN" {
+			t.Errorf("GET %s as %q: X-Frame-Options = %q on the check's own %d, want exactly SAMEORIGIN", tc.path, tc.user, got, tc.want)
+		}
+		if got := r.header.Values("Content-Security-Policy"); len(got) != 1 || got[0] != frameAncestors {
+			t.Errorf("GET %s as %q: Content-Security-Policy = %q on the check's own %d, want exactly %q", tc.path, tc.user, got, tc.want, frameAncestors)
 		}
 	}
 

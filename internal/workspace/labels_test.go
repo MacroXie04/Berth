@@ -21,14 +21,14 @@ func TestLabelsForAUser(t *testing.T) {
 
 		"traefik.http.routers.alice-term.entrypoints":                    "web",
 		"traefik.http.routers.alice-term.rule":                           "PathPrefix(`/ws/alice/terminal`)",
-		"traefik.http.routers.alice-term.middlewares":                    "berth-auth@file,berth-ws-headers@file,alice-term-strip",
+		"traefik.http.routers.alice-term.middlewares":                    "berth-auth@file,alice-term-strip",
 		"traefik.http.routers.alice-term.service":                        "alice-term",
 		"traefik.http.middlewares.alice-term-strip.stripprefix.prefixes": "/ws/alice/terminal",
 		"traefik.http.services.alice-term.loadbalancer.server.port":      "7681",
 
 		"traefik.http.routers.alice-browser.entrypoints":               "web",
 		"traefik.http.routers.alice-browser.rule":                      "PathPrefix(`/ws/alice/browser`)",
-		"traefik.http.routers.alice-browser.middlewares":               "berth-auth@file,berth-ws-headers@file",
+		"traefik.http.routers.alice-browser.middlewares":               "berth-auth@file",
 		"traefik.http.routers.alice-browser.service":                   "alice-browser",
 		"traefik.http.services.alice-browser.loadbalancer.server.port": "8080",
 	}
@@ -45,27 +45,28 @@ func TestLabelsForAUser(t *testing.T) {
 }
 
 // The order of `middlewares` is load-bearing: ForwardAuth sees the URL as it is
-// when it runs, so it must run before StripPrefix, and the response-header
-// middleware sits between them (after the auth check, before the URL is
-// rewritten).
-func TestMiddlewareOrder(t *testing.T) {
+// when it runs, so the auth chain must run before StripPrefix.
+func TestAuthRunsBeforeStripPrefix(t *testing.T) {
 	l := Labels("alice", "berth-net-alice", "web")
-	// The literal middleware names, not the constants: they are what dynamic.yml
+	// The literal middleware names, not the constant: they are what dynamic.yml
 	// defines and what Traefik resolves.
 	chain := strings.Split(l["traefik.http.routers.alice-term.middlewares"], ",")
-	if len(chain) != 3 || chain[0] != "berth-auth@file" || chain[1] != "berth-ws-headers@file" || chain[2] != "alice-term-strip" {
-		t.Fatalf("terminal middleware chain = %v, want [berth-auth@file berth-ws-headers@file alice-term-strip]", chain)
+	if len(chain) != 2 || chain[0] != "berth-auth@file" || chain[1] != "alice-term-strip" {
+		t.Fatalf("terminal middleware chain = %v, want [berth-auth@file alice-term-strip]", chain)
 	}
-	chain = strings.Split(l["traefik.http.routers.alice-browser.middlewares"], ",")
-	if len(chain) != 2 || chain[0] != "berth-auth@file" || chain[1] != "berth-ws-headers@file" {
-		t.Fatalf("browser middleware chain = %v, want [berth-auth@file berth-ws-headers@file]", chain)
+	if chain = strings.Split(l["traefik.http.routers.alice-browser.middlewares"], ","); len(chain) != 1 || chain[0] != "berth-auth@file" {
+		t.Fatalf("browser middleware chain = %v, want [berth-auth@file]", chain)
 	}
-	if AuthMiddleware != "berth-auth@file" || WSHeadersMiddleware != "berth-ws-headers@file" {
-		t.Errorf("middleware constants = %q, %q", AuthMiddleware, WSHeadersMiddleware)
+	if AuthMiddleware != "berth-auth@file" {
+		t.Errorf("AuthMiddleware = %q", AuthMiddleware)
 	}
-
-	// Every router that is declared has middlewares declared, starts with the
-	// auth check and carries the response headers: neither may exist without them.
+	// Neither router may exist without the auth middleware.
+	for k, v := range l {
+		if strings.HasSuffix(k, ".middlewares") && !strings.HasPrefix(v, AuthMiddleware) {
+			t.Errorf("%s = %q does not start with the auth middleware", k, v)
+		}
+	}
+	// Every router that is declared has middlewares declared.
 	routers := map[string]bool{}
 	for k := range l {
 		if rest, ok := strings.CutPrefix(k, "traefik.http.routers."); ok {
@@ -81,14 +82,8 @@ func TestMiddlewareOrder(t *testing.T) {
 			t.Errorf("router %s has no middlewares", r)
 			continue
 		}
-		list := strings.Split(mw, ",")
-		if list[0] != AuthMiddleware {
-			t.Errorf("router %s middlewares %q do not start with the auth middleware", r, mw)
-		}
-		if !slices.Contains(list, WSHeadersMiddleware) {
-			t.Errorf("router %s middlewares %q lack the response-header middleware", r, mw)
-		}
 		// The strip middleware, where there is one, comes last: it rewrites the URL.
+		list := strings.Split(mw, ",")
 		for i, name := range list {
 			if strings.HasSuffix(name, "-strip") && i != len(list)-1 {
 				t.Errorf("router %s: %s is not the last middleware: %q", r, name, mw)

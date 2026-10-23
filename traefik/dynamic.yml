@@ -4,10 +4,21 @@
 # Traefik's Docker provider drops a container that is starting or unhealthy, and
 # a middleware defined on it would vanish with it, turning every workspace route
 # into a 404. Defined here, it always exists, and a dead backend makes the check
-# fail with a 5xx instead. Workspace routers reference it as berth-auth@file.
+# fail with a 5xx instead. Workspace routers reference berth-auth@file, a chain
+# of the response headers below and the check, so a router needs only that one
+# name and the headers cannot be left off a route.
 http:
   middlewares:
+    # What every /ws/ route runs: response headers first, so they are on the 401
+    # and 403 the check writes itself as well, then the check. Both sit before
+    # StripPrefix in a workspace router (the check must see the unstripped URI).
     berth-auth:
+      chain:
+        middlewares:
+          - berth-ws-headers
+          - berth-forward-auth
+
+    berth-forward-auth:
       forwardAuth:
         address: http://berth:8080/api/auth/check
         # Traefik must fill X-Forwarded-Uri itself; never take it from the client.
@@ -20,10 +31,10 @@ http:
         maxResponseBodySize: 4096
 
     # Response headers for everything served under /ws/ (ttyd, neko, and the
-    # catch-all below). Workspace routers list it right after berth-auth and
-    # before StripPrefix; it sits on the response path only, so it changes
-    # nothing about what the auth check sees. A header set here replaces the
-    # workspace's own, which is the point: the workspace is not trusted.
+    # catch-all below), applied through berth-auth. It sits on the response path
+    # only, so it changes nothing about what the auth check sees. A header set
+    # here replaces the workspace's own, which is the point: the workspace is not
+    # trusted.
     #
     #  - Framing. SameSite=Lax does not stop a page on a sibling origin of the same
     #    site (another port or subdomain) from framing the victim's live terminal
@@ -60,7 +71,6 @@ http:
       priority: 2
       middlewares:
         - berth-auth
-        - berth-ws-headers
       service: berth-ws-fallback
   services:
     berth-ws-fallback:
