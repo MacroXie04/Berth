@@ -94,7 +94,12 @@ func TestObserve(t *testing.T) {
 		{"offline + exited => nothing", store.StateOffline, notRunning("exited"), "", false},
 
 		// A refresh that races Start must never undo it.
-		{"starting + created (create done, start pending) => wait", store.StateStarting, notRunning("created"), "", false},
+		// During a start a created container is normal; Manager.Status applies this
+		// only when no start of this process is in flight (the start died before
+		// `docker start`).
+		{"starting + created (never started) => stopped", store.StateStarting, notRunning("created"), EventExited, true},
+		{"stopped + created => nothing", store.StateStopped, notRunning("created"), "", false},
+		{"running + created => nothing", store.StateRunning, notRunning("created"), "", false},
 		{"running + paused => nothing", store.StateRunning, notRunning("paused"), "", false},
 		{"running + restarting => nothing", store.StateRunning, notRunning("restarting"), "", false},
 		{"running + removing => nothing", store.StateRunning, notRunning("removing"), "", false},

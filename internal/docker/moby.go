@@ -52,6 +52,25 @@ func (m *Moby) Ping(ctx context.Context) error {
 	return nil
 }
 
+// SupportsGatewayPriority reports whether the daemon, as negotiated at Ping,
+// honours the endpoint gateway priority that ConnectToNetwork sends (Docker
+// Engine 28, API 1.48). An older engine silently ignores it: Traefik's default
+// gateway then flips to the new user network, and the first power-on of every
+// new user resets the connections through Traefik. Call it after a successful
+// Ping; before that the client has not negotiated a version yet.
+func (m *Moby) SupportsGatewayPriority() bool {
+	return apiAtLeast(m.c.ClientVersion(), 1, 48)
+}
+
+// apiAtLeast compares a "major.minor" Docker API version.
+func apiAtLeast(v string, major, minor int) bool {
+	var maj, min int
+	if n, _ := fmt.Sscanf(v, "%d.%d", &maj, &min); n != 2 {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
+}
+
 func (m *Moby) EnsureNetwork(ctx context.Context, name string, labels map[string]string) error {
 	_, err := m.c.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
 	if err == nil {

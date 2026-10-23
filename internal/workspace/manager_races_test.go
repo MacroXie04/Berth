@@ -333,7 +333,7 @@ func TestRollbackWithAnUnreachableDaemonKeepsTheKeptContainer(t *testing.T) {
 	}
 }
 
-func TestFailedRemovalOfAHalfCreatedContainerKeepsItsPorts(t *testing.T) {
+func TestFailedRemovalOfAHalfCreatedContainerKeepsItAndItsPorts(t *testing.T) {
 	r := newRig(t)
 	alice, bob := r.user("alice"), r.user("bob")
 	down := fmt.Errorf("remove: %w", docker.ErrUnavailable)
@@ -342,13 +342,15 @@ func TestFailedRemovalOfAHalfCreatedContainerKeepsItsPorts(t *testing.T) {
 	if _, err := r.m.Start(ctx, alice); err == nil {
 		t.Fatal("Start succeeded")
 	}
-	ws := r.ws(alice)
-	if ws.State != store.StateOffline || ws.ContainerID != "" || ws.UDPPortStart == 0 {
-		t.Fatalf("row: %+v; the block must stay allocated while its container may still exist", ws)
-	}
 	leftover := r.containerID("alice")
 	if leftover == "" {
 		t.Fatal("the fake lost the container the test meant to leave behind")
+	}
+	ws := r.ws(alice)
+	// The container may still come up, so the row keeps its id (it can be observed
+	// and stopped) and its block (the container publishes those ports).
+	if ws.State != store.StateStopped || ws.ContainerID != leftover || ws.UDPPortStart == 0 {
+		t.Fatalf("row: %+v; want stopped with container %s and its block kept", ws, leftover)
 	}
 
 	// Bob must not be handed the block the leftover still publishes.
@@ -356,9 +358,9 @@ func TestFailedRemovalOfAHalfCreatedContainerKeepsItsPorts(t *testing.T) {
 	if r.ws(bob).UDPPortStart == ws.UDPPortStart {
 		t.Fatalf("bob was given alice's block %d", ws.UDPPortStart)
 	}
-	// Alice's next start replaces the leftover and keeps her block.
+	// Alice's next start simply starts the container she has.
 	r.mustStart(alice)
-	if after := r.ws(alice); after.UDPPortStart != ws.UDPPortStart || after.ContainerID == leftover {
+	if after := r.ws(alice); after.UDPPortStart != ws.UDPPortStart || after.ContainerID != leftover || after.State != store.StateStarting {
 		t.Fatalf("alice after retry: %+v (leftover %s)", after, leftover)
 	}
 }
@@ -601,4 +603,392 @@ func TestAPanicDoesNotWedgeTheWorkspace(t *testing.T) {
 		t.Fatalf("Stop after a panicked start = %v, %v", s.Workspace.State, err)
 	}
 	r.mustStart(u)
+}
+
+// ---- observations that outlive the operation they overlapped -------------------
+
+// pausingStore holds the first WorkspaceByUserID call AFTER it has read the row.
+type pausingStore struct {
+	store.Store
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func newPausingStore(s store.Store) *pausingStore {
+	return &pausingStore{Store: s, reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *pausingStore) WorkspaceByUserID(c context.Context, id int64) (store.Workspace, error) {
+	ws, err := p.Store.WorkspaceByUserID(c, id)
+	if p.armed.CompareAndSwap(true, false) {
+		close(p.reached)
+		<-p.release
+	}
+	return ws, err
+}
+
+// holdingStore holds the first transition INTO a given state before it runs.
+type holdingStore struct {
+	store.Store
+	to      store.State
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func newHoldingStore(s store.Store, to store.State) *holdingStore {
+	return &holdingStore{Store: s, to: to, reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (h *holdingStore) TransitionWorkspace(c context.Context, userID int64, from []store.State, to store.State,
+	now time.Time, opts ...store.TransitionOption) (store.Workspace, error) {
+	if to == h.to && h.armed.CompareAndSwap(true, false) {
+		close(h.reached)
+		<-h.release
+	}
+	return h.Store.TransitionWorkspace(c, userID, from, to, now, opts...)
+}
+
+// withStore points the rig at a manager that reads and writes through s.
+func (r *rig) withStore(s store.Store) {
+	r.t.Helper()
+	m, err := NewManager(s, r.dock, testConfig(), nil, r.clock.Now)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.m = m
+}
+
+// A Status that took its mark while a start was running must not apply what it
+// saw once that start has finished: the container it saw "exited" is running now.
+func TestObservationMarkedDuringAStartCannotBeAppliedAfterItEnds(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	id := r.running(u)
+	if _, err := r.m.Stop(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+
+	inStart := newGate(r.dock, "StartContainer")
+	first := r.startAsync(u)
+	<-inStart.reached // the row says starting, the kept container is still exited
+
+	held := newAfterGate(r.dock)
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Status(ctx, u); done <- err }()
+	<-held.reached // Status marked during the start and holds "exited"
+
+	close(inStart.release)
+	if res := <-first; res.err != nil {
+		t.Fatal(res.err)
+	}
+	close(held.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ws := r.ws(u); ws.State != store.StateStarting || ws.ContainerID != id {
+		t.Fatalf("row = %+v; the stale 'exited' answer must not stop a workspace that has started", ws)
+	}
+}
+
+func TestObservationMarkedDuringARecreationCannotEraseTheNewContainer(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	old := r.running(u)
+	if _, err := r.m.Stop(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	r.dock.Vanish(old)
+	before := r.ws(u)
+
+	inCreate := newGate(r.dock, "CreateContainer")
+	first := r.startAsync(u)
+	<-inCreate.reached // row: starting, still recording the vanished container
+
+	held := newAfterGate(r.dock)
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Status(ctx, u); done <- err }()
+	<-held.reached // Status holds "container gone"
+
+	close(inCreate.release)
+	if res := <-first; res.err != nil {
+		t.Fatal(res.err)
+	}
+	close(held.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ws := r.ws(u)
+	if ws.State != store.StateStarting || ws.ContainerID == "" || ws.ContainerID == old || ws.UDPPortStart != before.UDPPortStart {
+		t.Fatalf("row = %+v; the replacement container and its block must survive", ws)
+	}
+	if info, err := r.dock.InspectContainer(ctx, ws.ContainerID); err != nil || !info.Running {
+		t.Fatalf("replacement container: %+v, %v", info, err)
+	}
+}
+
+// The mark is taken before the row is read, or an operation that begins and ends
+// between the two goes unnoticed.
+func TestStatusMarksBeforeItReadsTheRow(t *testing.T) {
+	r := newRig(t)
+	ps := newPausingStore(r.st)
+	r.withStore(ps)
+	u := r.user("alice")
+	old := r.running(u)
+	if _, err := r.m.Stop(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	r.dock.Vanish(old)
+
+	ps.armed.Store(true)
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Status(ctx, u); done <- err }()
+	<-ps.reached // Status holds a row that says: stopped, container `old`
+
+	r.mustStart(u)
+	replacement := r.ws(u).ContainerID
+	if _, err := r.m.Stop(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	close(ps.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ws := r.ws(u); ws.ContainerID != replacement || ws.UDPPortStart == 0 || ws.State != store.StateStopped {
+		t.Fatalf("the stale observation erased the replacement: %+v (replacement %s)", ws, replacement)
+	}
+}
+
+// Even an observation that passed every check and is already inside its database
+// write must not land on a row that has moved on to another container.
+func TestAnObservationInsideItsWriteCannotLandOnALaterClaim(t *testing.T) {
+	r := newRig(t)
+	hs := newHoldingStore(r.st, store.StateRunning)
+	r.withStore(hs)
+	u := r.user("alice")
+	x := r.mustStartContainer(u)
+	r.dock.SetHealth(x, docker.HealthHealthy)
+
+	hs.armed.Store(true)
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Status(ctx, u); done <- err }()
+	<-hs.reached // this Status is about to write starting -> running for container x
+
+	r.dock.Vanish(x) // x is removed by hand...
+	if s, err := r.m.Status(ctx, u); err != nil || s.Workspace.State != store.StateOffline {
+		t.Fatalf("Status after the removal = %v, %v", s.Workspace.State, err)
+	}
+	inCreate := newGate(r.dock, "CreateContainer") // ...and the user powers on again
+	second := r.startAsync(u)
+	<-inCreate.reached // the row is a fresh claim: starting, no container
+
+	close(hs.release) // the stale promotion now reaches the database
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ws := r.ws(u); ws.State != store.StateStarting || ws.ContainerID != "" {
+		t.Fatalf("row = %+v; a promotion of the old container landed on the new claim", ws)
+	}
+	close(inCreate.release)
+	if res := <-second; res.err != nil {
+		t.Fatalf("the second start failed: %v", res.err)
+	}
+	if ws := r.ws(u); ws.State != store.StateStarting || ws.ContainerID == "" || ws.ContainerID == x {
+		t.Fatalf("row after the second start: %+v", ws)
+	}
+}
+
+func (r *rig) mustStartContainer(u store.User) string {
+	r.t.Helper()
+	r.mustStart(u)
+	return r.containerID(u.Username)
+}
+
+// ---- recovery ---------------------------------------------------------------
+
+// The backend dies after recording a new container but before `docker start`.
+func TestAStartThatDiedBeforeDockerStartIsRecovered(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	armed := true
+	r.dock.SetHook("StartContainer", func(context.Context) {
+		if armed {
+			armed = false
+			panic("the process dies here")
+		}
+	})
+	func() {
+		defer func() { _ = recover() }()
+		r.m.Start(ctx, u)
+	}()
+	r.dock.SetHook("StartContainer", nil)
+	before := r.ws(u)
+	if before.State != store.StateStarting || before.ContainerID == "" {
+		t.Fatalf("setup: %+v", before)
+	}
+
+	// A new process: no claims, same database, same Docker.
+	r.withStore(r.st)
+	s, err := r.m.Status(ctx, u)
+	if err != nil || s.Workspace.State != store.StateStopped || s.Workspace.ContainerID != before.ContainerID {
+		t.Fatalf("Status = %+v, %v; want stopped with the container kept", s.Workspace, err)
+	}
+	r.mustStart(u)
+	ws := r.ws(u)
+	if ws.State != store.StateStarting || ws.ContainerID != before.ContainerID || ws.UDPPortStart != before.UDPPortStart {
+		t.Fatalf("after the retry: %+v", ws)
+	}
+	if info, _ := r.dock.InspectContainer(ctx, ws.ContainerID); !info.Running {
+		t.Fatal("the container was not started")
+	}
+}
+
+// A poll during a user's very first start sees `starting` with no container yet;
+// it must leave that start alone.
+func TestStatusDuringAFirstStartDoesNotRecoverIt(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	g := newGate(r.dock, "CreateContainer")
+	first := r.startAsync(u)
+	<-g.reached
+	var during store.Workspace
+	for i := 0; i < 2; i++ {
+		s, err := r.m.Status(ctx, u)
+		if err != nil || s.Workspace.State != store.StateStarting {
+			t.Fatalf("Status during the first start = %v, %v", s.Workspace.State, err)
+		}
+		during = s.Workspace
+	}
+	if during.UDPPortStart == 0 {
+		t.Fatalf("the start's port block was released: %+v", during)
+	}
+	close(g.release)
+	if res := <-first; res.err != nil {
+		t.Fatalf("the start failed after a concurrent Status: %v", res.err)
+	}
+	if ws := r.ws(u); ws.State != store.StateStarting || ws.ContainerID == "" || ws.UDPPortStart != during.UDPPortStart {
+		t.Fatalf("row: %+v", ws)
+	}
+}
+
+// A row that says running or stopped but records no container is impossible; it
+// is reset instead of wedging the user.
+func TestAnImpossibleRowIsReset(t *testing.T) {
+	for _, state := range []store.State{store.StateRunning, store.StateStopped} {
+		t.Run(string(state), func(t *testing.T) {
+			r := newRig(t)
+			u := r.user("alice")
+			r.abandoned(u) // starting, no container, a block allocated
+			if state == store.StateRunning {
+				if _, err := r.st.TransitionWorkspace(ctx, u.ID, []store.State{store.StateStarting}, store.StateRunning, t0); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := r.st.TransitionWorkspace(ctx, u.ID, []store.State{store.StateStarting}, store.StateStopped, t0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := r.m.Status(ctx, u)
+			if err != nil || s.Workspace.State != store.StateOffline {
+				t.Fatalf("Status = %v, %v", s.Workspace.State, err)
+			}
+			if ws := r.ws(u); ws.UDPPortStart != 0 || ws.ContainerID != "" {
+				t.Fatalf("row: %+v", ws)
+			}
+			r.mustStart(u)
+		})
+	}
+}
+
+// ---- the block of ports is freed only when nothing can still be holding it -----
+
+func TestRollbackKeepsTheBlockWhenDockerCannotBeAskedAboutALostCreate(t *testing.T) {
+	r := newRig(t)
+	alice, bob := r.user("alice"), r.user("bob")
+	down := fmt.Errorf("inspect: %w", docker.ErrUnavailable)
+	r.dock.LoseNextCreateResponse(context.Canceled) // the daemon created it, the reply was lost
+	r.dock.FailNext("InspectContainer", down)       // and the rollback's look by name fails
+	if _, err := r.m.Start(ctx, alice); err == nil {
+		t.Fatal("Start succeeded")
+	}
+	ws := r.ws(alice)
+	if ws.State != store.StateOffline || ws.ContainerID != "" || ws.UDPPortStart == 0 {
+		t.Fatalf("row: %+v; the block must stay allocated while a container may hold it", ws)
+	}
+	leftover := r.containerID("alice")
+	if leftover == "" {
+		t.Fatal("the test meant to leave a container behind")
+	}
+	r.mustStart(bob)
+	if r.ws(bob).UDPPortStart == ws.UDPPortStart {
+		t.Fatalf("bob was given alice's block %d", ws.UDPPortStart)
+	}
+	r.mustStart(alice) // replaces the leftover, keeps the block
+	if after := r.ws(alice); after.UDPPortStart != ws.UDPPortStart || after.ContainerID == leftover {
+		t.Fatalf("alice after retry: %+v", after)
+	}
+}
+
+func TestRecoveryKeepsTheBlockWhenTheOrphanCannotBeRemovedOrInspected(t *testing.T) {
+	cases := map[string]func(r *rig){
+		"remove fails":  func(r *rig) { r.dock.FailNext("RemoveContainer", fmt.Errorf("rm: %w", docker.ErrUnavailable)) },
+		"inspect fails": func(r *rig) { r.dock.FailNext("InspectContainer", fmt.Errorf("inspect: %w", docker.ErrUnavailable)) },
+	}
+	for name, fault := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			alice, bob := r.user("alice"), r.user("bob")
+			r.abandoned(alice)
+			held := r.ws(alice).UDPPortStart
+			r.orphan("alice")
+			fault(r)
+			if _, err := r.m.Status(ctx, alice); err != nil {
+				t.Fatal(err)
+			}
+			ws := r.ws(alice)
+			if ws.State != store.StateOffline || ws.UDPPortStart != held || held == 0 {
+				t.Fatalf("row: %+v; the block must be kept while the orphan may hold it", ws)
+			}
+			r.mustStart(bob)
+			if r.ws(bob).UDPPortStart == held {
+				t.Fatalf("bob was given alice's block %d", held)
+			}
+		})
+	}
+}
+
+// A recorded container that this attempt could not remove may be starting: the
+// workspace must still be observable and stoppable.
+func TestAnUnremovableHalfStartedContainerStaysManaged(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	startedBehindTheScenes := false
+	r.dock.SetHook("StartContainer", func(c context.Context) {
+		if !startedBehindTheScenes {
+			startedBehindTheScenes = true
+			// the daemon starts the container although the reply never arrives
+			r.dock.StartContainer(c, r.dock.ContainerIDByName("berth-ws-alice"))
+			r.dock.FailNext("StartContainer", context.DeadlineExceeded)
+		}
+	})
+	r.dock.FailNext("RemoveContainer", fmt.Errorf("rm: %w", docker.ErrUnavailable))
+	if _, err := r.m.Start(ctx, u); err == nil {
+		t.Fatal("Start succeeded")
+	}
+	r.dock.SetHook("StartContainer", nil)
+	id := r.containerID("alice")
+	ws := r.ws(u)
+	if ws.ContainerID != id || ws.UDPPortStart == 0 || ws.State == store.StateOffline {
+		t.Fatalf("row: %+v; the running container %s must stay recorded", ws, id)
+	}
+	if s, err := r.m.Status(ctx, u); err != nil || s.Workspace.State != store.StateStarting {
+		t.Fatalf("Status = %v, %v; want it picked up as starting", s.Workspace.State, err)
+	}
+	if s, err := r.m.Stop(ctx, u); err != nil || s.Workspace.State != store.StateStopped {
+		t.Fatalf("Stop = %v, %v", s.Workspace.State, err)
+	}
+	if info, _ := r.dock.InspectContainer(ctx, id); info.Running {
+		t.Fatal("the container is still running after Stop")
+	}
 }

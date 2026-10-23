@@ -101,10 +101,14 @@ func (f *flights) begin(id int64, op string) (string, bool) {
 	return "", true
 }
 
+// end releases the claim. It advances the epoch too: an observer that took its
+// mark while the operation was running must not trust what it saw once the
+// operation has finished.
 func (f *flights) end(id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.active, id)
+	f.epoch[id]++
 }
 
 // mark is taken before an observation reads anything: the epoch to compare
@@ -376,9 +380,15 @@ func (m *Manager) rollback(user store.User, createdID string) {
 	// A container recorded before this attempt: it survives unless Docker says it
 	// does not exist.
 	keptSurvives := false
-	if ws.ContainerID != "" && ws.ContainerID != createdID {
+	switch {
+	case ws.ContainerID != "" && ws.ContainerID != createdID:
 		_, ierr := m.docker.InspectContainer(ctx, ws.ContainerID)
 		keptSurvives = ierr == nil || !errors.Is(ierr, docker.ErrNotFound)
+	case ws.ContainerID != "" && !createdGone:
+		// This attempt's own container, recorded, and we could not remove it: it
+		// may be starting right now. Keep the record so the workspace can still be
+		// observed and stopped; a later Status promotes it if it comes up.
+		keptSurvives = true
 	}
 
 	now := m.now()
@@ -412,24 +422,29 @@ func (m *Manager) recoverAbandoned(ctx context.Context, user store.User) error {
 }
 
 // recoverClaimed does the work of recoverAbandoned for a caller that already
-// owns the workspace. A `starting` row without a container is abandoned for
-// certain: a live start records the container (or rolls back) before it
-// releases its claim, and nothing is running now.
+// owns the workspace. A row that is not offline but records no container cannot
+// be right: a live start records the container (or rolls back) before it
+// releases its claim, and nothing is running now. Whatever a half-finished start
+// left under the workspace's name is removed, and the UDP block is freed only
+// when Docker confirms nothing is left holding it.
 func (m *Manager) recoverClaimed(ctx context.Context, user store.User) error {
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
 		return err
 	}
-	if ws.State != store.StateStarting || ws.ContainerID != "" {
+	if ws.State == store.StateOffline || ws.ContainerID != "" {
 		return nil
 	}
-	m.log.Warn("recovering a start that never finished", "user", user.Username)
-	opts := []store.TransitionOption{store.ClearContainer()}
+	m.log.Warn("recovering a workspace that has no container", "user", user.Username, "state", ws.State)
+	opts := []store.TransitionOption{store.ClearContainer(), store.OnlyIfContainer("")}
 	if m.sweepOrphan(ctx, user) {
 		opts = append(opts, store.ReleaseUDPRange())
 	}
-	to, _ := Next(store.StateStarting, EventGone)
-	if _, err := m.store.TransitionWorkspace(ctx, user.ID, []store.State{store.StateStarting}, to, m.now(), opts...); err != nil &&
+	to, err := Next(ws.State, EventGone)
+	if err != nil {
+		return err
+	}
+	if _, err := m.store.TransitionWorkspace(ctx, user.ID, []store.State{ws.State}, to, m.now(), opts...); err != nil &&
 		!errors.Is(err, store.ErrStateConflict) {
 		return err
 	}
@@ -506,8 +521,9 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 		return Status{}, err
 	}
 	st := Status{Workspace: ws}
-	if ws.State == store.StateStarting && ws.ContainerID == "" {
-		// Nothing is starting it (it would hold the claim): abandoned.
+	if ws.State != store.StateOffline && ws.ContainerID == "" {
+		// No container although the row says there is a workspace, and nothing is
+		// starting one (it would hold the claim): abandoned.
 		if err := m.recoverAbandoned(ctx, user); err != nil {
 			return Status{}, err
 		}
@@ -529,7 +545,7 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 		}
 		m.log.Warn("workspace container is gone", "user", user.Username, "container", ws.ContainerID)
 		updated, terr := m.store.TransitionWorkspace(ctx, user.ID, []store.State{ws.State}, to, m.now(),
-			store.ClearContainer(), store.ReleaseUDPRange())
+			store.ClearContainer(), store.ReleaseUDPRange(), store.OnlyIfContainer(ws.ContainerID))
 		if terr != nil && !errors.Is(terr, store.ErrStateConflict) {
 			return Status{}, terr
 		}
@@ -547,7 +563,7 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 
 	if ev, ok := Observe(ws.State, info); ok && m.flight.unchanged(user.ID, epoch) {
 		to, _ := Next(ws.State, ev)
-		var opts []store.TransitionOption
+		opts := []store.TransitionOption{store.OnlyIfContainer(ws.ContainerID)}
 		if to == store.StateStopped {
 			stopped := info.FinishedAt
 			if stopped.IsZero() {

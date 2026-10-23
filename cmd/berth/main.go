@@ -59,6 +59,10 @@ func run() error {
 		// Not fatal: accounts and login work without Docker, and the daemon may
 		// simply come up after us.
 		log.Warn("Docker is not reachable; workspace endpoints will fail until it is", "err", err)
+	} else if cfg.TraefikContainer != "" && !dock.SupportsGatewayPriority() {
+		log.Error("this Docker Engine is older than 28 (API < 1.48) and ignores the gateway priority Berth " +
+			"sets when it attaches Traefik to a user network: the first power-on of each new user will reset " +
+			"the connections of everyone currently using Traefik. Upgrade Docker Engine to 28 or newer.")
 	}
 	cancelPing()
 

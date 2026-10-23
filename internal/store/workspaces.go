@@ -13,8 +13,10 @@ import (
 type TransitionOption func(*transition)
 
 type transition struct {
-	sets []string
-	args []any
+	sets      []string
+	args      []any
+	wheres    []string // extra conditions, ANDed after the state check
+	whereArgs []any
 }
 
 func (t *transition) set(col string, v any) {
@@ -54,6 +56,17 @@ func ReleaseUDPRange() TransitionOption {
 	}
 }
 
+// OnlyIfContainer makes the transition apply only while the workspace still
+// records container id ("" means none). An observation of one container must not
+// change a row that has since moved on to another; a mismatch is reported as
+// ErrStateConflict, like a state mismatch.
+func OnlyIfContainer(id string) TransitionOption {
+	return func(t *transition) {
+		t.wheres = append(t.wheres, "COALESCE(container_id, '') = ?")
+		t.whereArgs = append(t.whereArgs, id)
+	}
+}
+
 func (s *SQLite) TransitionWorkspace(ctx context.Context, userID int64, from []State, to State,
 	now time.Time, opts ...TransitionOption) (Workspace, error) {
 	if len(from) == 0 {
@@ -69,8 +82,12 @@ func (s *SQLite) TransitionWorkspace(ctx context.Context, userID int64, from []S
 	for _, f := range from {
 		args = append(args, string(f))
 	}
+	args = append(args, t.whereArgs...)
 	q := fmt.Sprintf(`UPDATE workspaces SET %s WHERE user_id = ? AND state IN (%s)`,
 		strings.Join(sets, ", "), strings.TrimSuffix(strings.Repeat("?,", len(from)), ","))
+	for _, w := range t.wheres {
+		q += " AND " + w
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

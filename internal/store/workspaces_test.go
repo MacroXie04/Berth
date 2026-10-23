@@ -382,3 +382,43 @@ func TestUpgradeFromVersion1KeepsData(t *testing.T) {
 		t.Fatalf("user_version = %d, want %d", v, len(migs))
 	}
 }
+
+// An observation of one container must not change a row that records another.
+func TestTransitionOnlyIfContainer(t *testing.T) {
+	s := openTest(t)
+	u := mustUser(t, s, "alice")
+	from := []State{StateOffline, StateStarting}
+
+	// No container recorded: only "" matches.
+	if _, err := s.TransitionWorkspace(ctx, u.ID, from, StateStarting, t0, OnlyIfContainer("c1")); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("pin to c1 on an empty row: %v, want ErrStateConflict", err)
+	}
+	if ws, err := s.WorkspaceByUserID(ctx, u.ID); err != nil || ws.State != StateOffline {
+		t.Fatalf("a refused transition changed the row: %+v, %v", ws, err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, u.ID, from, StateStarting, t0, OnlyIfContainer("")); err != nil {
+		t.Fatalf("pin to \"\" on an empty row: %v", err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, u.ID, []State{StateStarting}, StateStarting, t0, SetContainerID("c1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Container c1 recorded.
+	if _, err := s.TransitionWorkspace(ctx, u.ID, []State{StateStarting}, StateRunning, t0, OnlyIfContainer("c2")); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("pin to c2 while c1 is recorded: %v, want ErrStateConflict", err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, u.ID, []State{StateStarting}, StateRunning, t0, OnlyIfContainer("")); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("pin to \"\" while c1 is recorded: %v, want ErrStateConflict", err)
+	}
+	if ws, err := s.TransitionWorkspace(ctx, u.ID, []State{StateStarting}, StateRunning, t0, OnlyIfContainer("c1")); err != nil || ws.State != StateRunning {
+		t.Fatalf("pin to c1 while c1 is recorded: %+v, %v", ws, err)
+	}
+	// A wrong state still conflicts even when the container matches, and a missing
+	// workspace is still ErrNotFound.
+	if _, err := s.TransitionWorkspace(ctx, u.ID, []State{StateStarting}, StateStopped, t0, OnlyIfContainer("c1")); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("wrong state: %v", err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, 999999, from, StateStarting, t0, OnlyIfContainer("")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing workspace: %v", err)
+	}
+}

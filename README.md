@@ -49,6 +49,7 @@ curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspa
 
 ### Host requirements
 
+- **Docker Engine 28 or newer.** When the backend attaches Traefik to a user's network it sets a low gateway priority, which Engine 28 (API 1.48) introduced; older engines ignore it, and the first power-on of every new user then resets the connections of everyone using Traefik. The backend logs an error at startup if it finds an older engine.
 - **Docker address pools.** Every user gets a private Docker network, and a default Docker daemon runs out of address space after about 30 networks (`all predefined address pools have been fully subnetted`). Before onboarding more users, give Docker smaller subnets in `/etc/docker/daemon.json` and restart it. This allows about 4000 networks:
 
   ```json

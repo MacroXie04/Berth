@@ -73,10 +73,12 @@ func Next(from store.State, ev Event) (store.State, error) {
 // event the database should catch up with, if any. current is the state the
 // database holds.
 //
-// It is deliberately conservative: a container that is merely "created" or
-// still starting up, an unhealthy running container, and anything transient
-// (paused, restarting, removing) produce no event, so a refresh racing a
-// Start in flight can never undo it.
+// It is deliberately conservative: a container still starting up, an unhealthy
+// running container, and anything transient (paused, restarting, removing)
+// produce no event. A container that was created but never started or has
+// exited is "not running" for a `starting` row only: the caller (Manager.Status)
+// applies that only when no start or stop of this process is in flight, since
+// during a start that very state is normal.
 func Observe(current store.State, info docker.ContainerInfo) (Event, bool) {
 	if info.Running {
 		switch info.Health {
@@ -102,6 +104,11 @@ func Observe(current store.State, info docker.ContainerInfo) (Event, bool) {
 	switch info.Status {
 	case "exited", "dead":
 		if current == store.StateStarting || current == store.StateRunning {
+			return EventExited, true
+		}
+	case "created":
+		// Never started: the start that made it died before `docker start`.
+		if current == store.StateStarting {
 			return EventExited, true
 		}
 	}
