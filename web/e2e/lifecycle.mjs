@@ -222,28 +222,37 @@ try {
       return `udp/${port}`
     })
 
-    await run('browser: a click and typing in the video reach the remote Chromium (the search shows up in its history)', async () => {
+    await run('browser: a click and a key chord in the video reach the remote Chromium (observed with xdotool)', async () => {
       const f = nekoFrame(page)
       const box = await f.locator('video').boundingBox()
       if (!box) throw new Error('no video box')
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2) // implicit hosting: the first click takes control
-      await sleep(500)
-      // Unshifted characters only: synthetic shifted keys are unreliable against neko's keyboard handler.
-      const token = `m3typed${Date.now() % 100000}`
-      await page.keyboard.press('Control+L') // focus the remote omnibox
-      await sleep(400)
-      await page.keyboard.type(token)
-      await page.keyboard.press('Enter') // the omnibox turns it into a search; the visit lands in Chromium's history
-      const py = "import sqlite3,shutil,sys;shutil.copy('/home/user/.config/chromium/Default/History','/tmp/e2e-history.db');" +
-        "c=sqlite3.connect('/tmp/e2e-history.db');print('\\n'.join(r[0] for r in c.execute('select url from urls where url like ?',('%'+sys.argv[1]+'%',))))"
-      const url = await waitFor(
-        () => {
-          const out = dockerTry('exec', CONTAINER, 'python3', '-c', py, token)
-          return out && out.trim() ? out.trim().split('\n')[0] : null
-        },
-        { timeout: 30000, interval: 1000, what: `${token} to appear in the remote Chromium's history` },
-      )
-      return `visited ${url.replace(token, '<token>')}`
+      const windows = () => (dockerTry('exec', CONTAINER, 'sh', '-c', 'DISPLAY=:99.0 xdotool search --onlyvisible --class chromium 2>/dev/null') ?? '').trim().split('\n').filter(Boolean)
+      const names = () => dockerTry('exec', CONTAINER, 'sh', '-c', 'DISPLAY=:99.0 xdotool search --onlyvisible --class chromium getwindowname %@ 2>/dev/null') ?? ''
+
+      // Mouse: a fresh remote Chromium shows the New Tab page with one "Web Store" tile in the middle of the screen.
+      // The first click also takes control (implicit hosting), and is replayed.
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+      await waitFor(() => /chrome\.google\.com/.test(names()), { timeout: 20000, interval: 500, what: 'the click on the Web Store tile to navigate the remote browser' })
+
+      // Keyboard: Playwright's high-level press() does not produce events neko's keyboard handler accepts; physical-shaped
+      // raw events do. Ctrl+N opens a new remote window, which xdotool counts.
+      const cdp = await ctx.newCDPSession(page)
+      const key = (type, o) => cdp.send('Input.dispatchKeyEvent', { type, ...o })
+      const chord = async (k, code, vk) => {
+        await key('rawKeyDown', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, modifiers: 0 })
+        await sleep(80)
+        await key('rawKeyDown', { key: k, code, windowsVirtualKeyCode: vk, modifiers: 2 })
+        await sleep(80)
+        await key('keyUp', { key: k, code, windowsVirtualKeyCode: vk, modifiers: 2 })
+        await sleep(80)
+        await key('keyUp', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, modifiers: 0 })
+      }
+      const before = windows().length
+      await chord('n', 'KeyN', 78)
+      await waitFor(() => windows().length === before + 1, { timeout: 15000, interval: 500, what: `Ctrl+N to open a second remote window (had ${before})` })
+      await chord('w', 'KeyW', 87) // and close it again
+      await waitFor(() => windows().length === before, { timeout: 15000, interval: 500, what: 'Ctrl+W to close it' })
+      return `click navigated (${names().trim().split('\n')[0]}); Ctrl+N opened and Ctrl+W closed a remote window`
     })
     await shot(page, 'lifecycle-3-typed')
   }
