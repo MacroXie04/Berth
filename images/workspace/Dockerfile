@@ -25,7 +25,8 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-# 2. Our files: ttyd's supervisord program, the Chromium launcher, the healthcheck,
+# 2. Our files: ttyd's supervisord program, the Chromium launcher, the healthcheck, an extra
+#    Chromium policy (cookies persist; neko's seeded Preferences make them session-only),
 #    and the dotfile skeleton (kept in /etc/berth/skel, installed into the home in step 3).
 COPY rootfs/ /
 
@@ -55,7 +56,18 @@ RUN set -eux; \
     install -o user -g user -m 0644 /etc/berth/skel/.bashrc  /home/user/.bashrc; \
     install -o user -g user -m 0644 /etc/berth/skel/.profile /home/user/.profile; \
     chmod 0755 /usr/local/bin/berth-chromium /usr/local/bin/berth-healthcheck; \
-    # 3f. assertions
+    # 3f. the base image ships /var/log/neko as 1777 chown $USERNAME so its own programs
+    #     (running as that user) could write there; every program here actually has its
+    #     stdout_logfile opened by supervisord itself (root, before it drops to user= for
+    #     the child), so the directory does not need to be user-writable, and leaving it so
+    #     lets "user" replace e.g. ttyd.conf's stdout_logfile with a symlink and have
+    #     supervisord (root) create/write the link target on the next respawn -- verified:
+    #     before this line a symlink there made supervisord create a root:root file at an
+    #     attacker-chosen path; after it, the same attempt gets EACCES and logging still
+    #     works (supervisord, not "user", opens/creates/rotates these files).
+    chown root:root /var/log/neko; \
+    chmod 0755 /var/log/neko; \
+    # 3g. assertions
     grep -q '^command=/usr/local/bin/berth-chromium$' /etc/neko/supervisord/chromium.conf; \
     grep -q -- '--user-data-dir=/home/user/.config/chromium$' /etc/neko/supervisord/chromium.conf; \
     grep -q '^chown=root:user$' /etc/neko/supervisord.conf; \
@@ -63,6 +75,8 @@ RUN set -eux; \
     if grep -rIl --exclude='*-' -e '/home/neko' -e 'root:neko' /etc; then echo 'leftover neko references' >&2; exit 1; fi; \
     test "$(id -u user)" = 1000; \
     test "$(getent passwd user | cut -d: -f6)" = /home/user; \
+    test "$(stat -c '%U:%G %a' /var/log/neko)" = 'root:root 755'; \
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /etc/chromium/policies/managed/berth.json; \
     command -v ttyd
 
 # neko runs its programs as $USER (supervisord.conf: user=%(ENV_USER)s)
@@ -72,9 +86,9 @@ ENV USER=user \
 EXPOSE 7681 8080
 
 # Healthy only when ttyd (:7681) AND neko (:8080, under NEKO_SERVER_PATH_PREFIX) answer HTTP.
-# A dead service is noticed after 3 failed probes (~15 s); a fresh container has 30 s
+# A dead service is noticed after 3 failed probes (~15 s); a fresh container has 40 s
 # during which failures do not count, and turns healthy at its first good probe.
-HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=5s --timeout=3s --start-period=40s --retries=3 \
     CMD ["/usr/local/bin/berth-healthcheck"]
 
 # CMD is inherited from the base image: supervisord -c /etc/neko/supervisord.conf

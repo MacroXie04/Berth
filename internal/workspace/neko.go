@@ -14,6 +14,9 @@ const (
 	envNekoEPR           = "NEKO_WEBRTC_EPR"
 	envNekoNAT1TO1       = "NEKO_WEBRTC_NAT1TO1"
 	envNekoPathPrefix    = "NEKO_SERVER_PATH_PREFIX"
+	envNekoProxy         = "NEKO_SERVER_PROXY"
+	envNekoHosting       = "NEKO_SESSION_IMPLICIT_HOSTING"
+	envNekoMetrics       = "NEKO_SERVER_METRICS"
 )
 
 // nekoEnv builds the KEY=value list for one workspace container.
@@ -29,6 +32,12 @@ func nekoEnv(cfg Config, username, userPassword, adminPassword string, udpStart,
 		envNekoAdminPassword + "=" + adminPassword,
 		// neko is not stripped by Traefik, so it must serve under its own prefix.
 		envNekoPathPrefix + "=" + PathPrefix(username, "browser"),
+		// Behind Traefik: trust its X-Forwarded-* headers.
+		envNekoProxy + "=true",
+		// The only person in the room gets control on the first click.
+		envNekoHosting + "=true",
+		// Otherwise <prefix>/metrics answers for any logged-in Berth user (verified).
+		envNekoMetrics + "=false",
 	}
 	if udpStart > 0 {
 		env = append(env, fmt.Sprintf("%s=%d-%d", envNekoEPR, udpStart, udpEnd))
