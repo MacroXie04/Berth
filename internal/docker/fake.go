@@ -21,6 +21,10 @@ type Fake struct {
 	containers map[string]*fakeContainer // by ID
 	failures   map[string][]error        // method name -> queued errors
 	calls      []string
+	hooks      map[string]func(context.Context)
+	afterHooks map[string]func(context.Context)
+	stopWait   time.Duration // the timeout of the last StopContainer call
+	lostCreate []error       // CreateContainer calls that do their work, then fail
 
 	// StartHealth is the health a container reports right after it is started;
 	// the zero value means HealthStarting, like an image with a healthcheck.
@@ -54,7 +58,69 @@ func NewFake(now func() time.Time) *Fake {
 		volumes:    map[string]map[string]string{},
 		containers: map[string]*fakeContainer{},
 		failures:   map[string][]error{},
+		hooks:      map[string]func(context.Context){},
+		afterHooks: map[string]func(context.Context){},
 	}
+}
+
+// SetAfterHook runs fn after every call to the named method has finished and its
+// result is fixed, outside the fake's lock: a test can hold a caller that already
+// holds an answer which then goes stale. Only InspectContainer calls it.
+func (f *Fake) SetAfterHook(method string, fn func(ctx context.Context)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if fn == nil {
+		delete(f.afterHooks, method)
+		return
+	}
+	f.afterHooks[method] = fn
+}
+
+func (f *Fake) runAfterHook(ctx context.Context, method string) {
+	f.mu.Lock()
+	fn := f.afterHooks[method]
+	f.mu.Unlock()
+	if fn != nil {
+		fn(ctx)
+	}
+}
+
+// SetHook runs fn at the start of every call to the named Client method, before
+// the fake's lock is taken, so a test can block a call midway (to interleave
+// another request with it) or cancel a context. nil removes the hook.
+func (f *Fake) SetHook(method string, fn func(ctx context.Context)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if fn == nil {
+		delete(f.hooks, method)
+		return
+	}
+	f.hooks[method] = fn
+}
+
+func (f *Fake) runHook(ctx context.Context, method string) {
+	f.mu.Lock()
+	fn := f.hooks[method]
+	f.mu.Unlock()
+	if fn != nil {
+		fn(ctx)
+	}
+}
+
+// LastStopTimeout is the grace period the most recent StopContainer call asked for.
+func (f *Fake) LastStopTimeout() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopWait
+}
+
+// LoseNextCreateResponse makes the next CreateContainer create the container
+// and then return err, like a connection that drops after the daemon did the
+// work: the caller never learns the container ID.
+func (f *Fake) LoseNextCreateResponse(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lostCreate = append(f.lostCreate, err)
 }
 
 func (f *Fake) record(call string) error {
@@ -210,7 +276,8 @@ func (c *fakeContainer) exit(at time.Time, code int) {
 	c.info.Status = "exited"
 	c.info.ExitCode = code
 	c.info.FinishedAt = at
-	c.info.Health = HealthNone
+	// Health is deliberately left as it was: the real daemon keeps reporting the
+	// last healthcheck status of a container that has exited.
 }
 
 func (f *Fake) idByNameLocked(name string) string {
@@ -240,12 +307,14 @@ func (f *Fake) removeLocked(id string) {
 }
 
 func (f *Fake) Ping(ctx context.Context) error {
+	f.runHook(ctx, "Ping")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.record("Ping")
 }
 
 func (f *Fake) EnsureNetwork(ctx context.Context, name string, labels map[string]string) error {
+	f.runHook(ctx, "EnsureNetwork")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("EnsureNetwork " + name); err != nil {
@@ -258,6 +327,7 @@ func (f *Fake) EnsureNetwork(ctx context.Context, name string, labels map[string
 }
 
 func (f *Fake) ManagedNetworks(ctx context.Context) ([]string, error) {
+	f.runHook(ctx, "ManagedNetworks")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("ManagedNetworks"); err != nil {
@@ -274,6 +344,7 @@ func (f *Fake) ManagedNetworks(ctx context.Context) ([]string, error) {
 }
 
 func (f *Fake) ConnectToNetwork(ctx context.Context, network, container string) error {
+	f.runHook(ctx, "ConnectToNetwork")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("ConnectToNetwork " + network + " " + container); err != nil {
@@ -292,6 +363,7 @@ func (f *Fake) ConnectToNetwork(ctx context.Context, network, container string) 
 }
 
 func (f *Fake) EnsureVolume(ctx context.Context, name string, labels map[string]string) error {
+	f.runHook(ctx, "EnsureVolume")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("EnsureVolume " + name); err != nil {
@@ -304,6 +376,7 @@ func (f *Fake) EnsureVolume(ctx context.Context, name string, labels map[string]
 }
 
 func (f *Fake) CreateContainer(ctx context.Context, spec ContainerSpec) (string, error) {
+	f.runHook(ctx, "CreateContainer")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("CreateContainer " + spec.Name); err != nil {
@@ -326,10 +399,16 @@ func (f *Fake) CreateContainer(ctx context.Context, spec ContainerSpec) (string,
 		n.members[id] = true
 	}
 	f.containers[id] = c
+	if len(f.lostCreate) > 0 {
+		err := f.lostCreate[0]
+		f.lostCreate = f.lostCreate[1:]
+		return "", err
+	}
 	return id, nil
 }
 
 func (f *Fake) StartContainer(ctx context.Context, id string) error {
+	f.runHook(ctx, "StartContainer")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("StartContainer " + id); err != nil {
@@ -359,11 +438,13 @@ func (f *Fake) StartContainer(ctx context.Context, id string) error {
 }
 
 func (f *Fake) StopContainer(ctx context.Context, id string, timeout time.Duration) error {
+	f.runHook(ctx, "StopContainer")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("StopContainer " + id); err != nil {
 		return err
 	}
+	f.stopWait = timeout
 	c := f.containers[id]
 	if c == nil {
 		return fmt.Errorf("%w: container %s", ErrNotFound, id)
@@ -375,6 +456,7 @@ func (f *Fake) StopContainer(ctx context.Context, id string, timeout time.Durati
 }
 
 func (f *Fake) RemoveContainer(ctx context.Context, id string) error {
+	f.runHook(ctx, "RemoveContainer")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("RemoveContainer " + id); err != nil {
@@ -385,6 +467,8 @@ func (f *Fake) RemoveContainer(ctx context.Context, id string) error {
 }
 
 func (f *Fake) InspectContainer(ctx context.Context, idOrName string) (ContainerInfo, error) {
+	f.runHook(ctx, "InspectContainer")
+	defer f.runAfterHook(ctx, "InspectContainer") // deferred first: runs after the lock is released
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("InspectContainer " + idOrName); err != nil {
@@ -407,6 +491,7 @@ func (f *Fake) InspectContainer(ctx context.Context, idOrName string) (Container
 }
 
 func (f *Fake) ContainerStats(ctx context.Context, id string) (Stats, error) {
+	f.runHook(ctx, "ContainerStats")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("ContainerStats " + id); err != nil {

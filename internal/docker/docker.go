@@ -17,6 +17,17 @@ var (
 	// ErrUnavailable means the Docker daemon could not be reached. Callers
 	// should test with IsUnavailable, which also recognises the SDK's own error.
 	ErrUnavailable = errors.New("docker: daemon unavailable")
+	// ErrNoAddressSpace means Docker has no subnet left for another network (its
+	// default pools hold about 30). It is a capacity problem, not a bug.
+	ErrNoAddressSpace = errors.New("docker: no address space for another network")
+	// ErrStaleContainer means a container exists but cannot be started because
+	// something it references is gone (typically its network was removed and
+	// recreated). Recreating the container fixes it; the data is on the volume.
+	ErrStaleContainer = errors.New("docker: container references objects that no longer exist")
+	// ErrLimitsNotEnforced means the daemon created a container but silently
+	// dropped a resource limit (memory or PIDs) the host cannot enforce. Berth
+	// treats its limits as a security invariant, so it refuses such a container.
+	ErrLimitsNotEnforced = errors.New("docker: the daemon cannot enforce the requested resource limits")
 )
 
 // Labels Berth puts on everything it creates, so it can find its own objects

@@ -68,12 +68,13 @@ func (s *Server) Handler() http.Handler {
 		r.Route("/auth", func(r chi.Router) {
 			r.Post("/register", s.handleRegister)
 			r.Post("/login", s.handleLogin)
-			r.Post("/logout", s.handleLogout)
+			r.With(requireJSON).Post("/logout", s.handleLogout)
 			r.Get("/check", s.handleCheck)
 		})
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireUser)
+			r.Use(requireJSON) // after the login check: a stranger still gets 401
 			r.Get("/me", s.handleMe)
 
 			r.Route("/workspace", func(r chi.Router) {

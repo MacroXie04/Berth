@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"mime"
 	"net/http"
 	"time"
 
@@ -46,6 +47,26 @@ func apiHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Cache-Control", "no-store")
 		h.Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireJSON refuses every state-changing API request that is not declared as
+// JSON, including the ones that have no body (power on/off, heartbeat, logout).
+// A cross-site HTML form can only send form encodings, and a cross-origin
+// fetch() with a JSON content type needs a CORS preflight that the API never
+// answers, so SameSite=Lax is not the only thing between a hostile sibling page
+// and "power off" on the user's workspace.
+func requireJSON(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+				return
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
 }

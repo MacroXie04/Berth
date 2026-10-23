@@ -1,6 +1,10 @@
 package docker
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -116,5 +120,84 @@ func TestIsUnavailable(t *testing.T) {
 	}
 	if !IsUnavailable(ErrUnavailable) {
 		t.Error("ErrUnavailable not recognised")
+	}
+}
+
+// The real production path: a daemon that cannot be reached surfaces from the SDK
+// as a connection error, wrapped by whichever method hit it. The API turns that
+// into a 503, so it has to be recognised without a daemon and through the wraps.
+func TestIsUnavailableRecognisesTheSDKsConnectionError(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(t.TempDir(), "no-such.sock"))
+	m, err := NewMoby()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for name, call := range map[string]func() error{
+		"Ping":             func() error { return m.Ping(ctx) },
+		"EnsureNetwork":    func() error { return m.EnsureNetwork(ctx, "n", nil) },
+		"InspectContainer": func() error { _, err := m.InspectContainer(ctx, "c"); return err },
+		"StopContainer":    func() error { return m.StopContainer(ctx, "c", time.Second) },
+		"ConnectToNetwork": func() error { return m.ConnectToNetwork(ctx, "n", "c") },
+		"ContainerStats":   func() error { _, err := m.ContainerStats(ctx, "c"); return err },
+	} {
+		err := call()
+		if err == nil {
+			t.Errorf("%s succeeded without a daemon", name)
+			continue
+		}
+		if !IsUnavailable(err) {
+			t.Errorf("%s: %v is not recognised as 'daemon unavailable'", name, err)
+		}
+		if errors.Is(err, ErrNotFound) {
+			t.Errorf("%s: an unreachable daemon was reported as 'not found'", name)
+		}
+	}
+	if IsUnavailable(fmt.Errorf("wrapped: %w", ErrNotFound)) {
+		t.Error("a missing container is not an unavailable daemon")
+	}
+}
+
+// Only the warnings that mean a limit was dropped make a container unacceptable.
+func TestLimitsDiscarded(t *testing.T) {
+	yes := [][]string{
+		{"Your kernel does not support memory limit capabilities or the cgroup is not mounted. Limitation discarded."},
+		{"Your kernel does not support PIDs limit capabilities or the cgroup is not mounted. PIDs limit discarded."},
+		{"something harmless", "Your kernel does not support CPU limit capabilities. Limitation discarded."},
+	}
+	no := [][]string{
+		nil,
+		{},
+		{"Your kernel does not support swap limit capabilities or the cgroup is not mounted. Memory limited without swap."},
+	}
+	for _, w := range yes {
+		if !limitsDiscarded(w) {
+			t.Errorf("limitsDiscarded(%q) = false", w)
+		}
+	}
+	for _, w := range no {
+		if limitsDiscarded(w) {
+			t.Errorf("limitsDiscarded(%q) = true", w)
+		}
+	}
+}
+
+func TestAddressSpaceExhausted(t *testing.T) {
+	yes := []string{
+		"Error response from daemon: all predefined address pools have been fully subnetted",
+		"could not find an available, non-overlapping IPv4 address pool among the defaults to assign to the network",
+	}
+	for _, msg := range yes {
+		if !addressSpaceExhausted(fmt.Errorf("docker: create network n: %w", errors.New(msg))) {
+			t.Errorf("not recognised: %s", msg)
+		}
+	}
+	for _, msg := range []string{"network with name n already exists", "invalid network name", "permission denied"} {
+		if addressSpaceExhausted(errors.New(msg)) {
+			t.Errorf("wrongly recognised: %s", msg)
+		}
 	}
 }

@@ -18,3 +18,25 @@ http:
           - Cookie
         # The check replies with a few bytes; refuse to read more than 4 KiB.
         maxResponseBodySize: 4096
+
+  # Catch-all for /ws/. A workspace router exists only while its container is up
+  # and healthy; for every other state or name Traefik would answer 404 before any
+  # authentication ran, which tells an anonymous caller who has a workspace running
+  # (and when). This router has the lowest priority, so each per-user router (a
+  # longer rule) still wins when it exists; otherwise the request goes through the
+  # same check: no session gets 401, someone else's path gets 403, and only the
+  # owner reaches the backend, which answers 404.
+  routers:
+    berth-ws-fallback:
+      entryPoints:
+        - web
+      rule: PathPrefix(`/ws/`)
+      priority: 1
+      middlewares:
+        - berth-auth
+      service: berth-ws-fallback
+  services:
+    berth-ws-fallback:
+      loadBalancer:
+        servers:
+          - url: http://berth:8080

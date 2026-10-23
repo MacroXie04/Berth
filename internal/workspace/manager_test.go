@@ -355,18 +355,6 @@ func TestStopWhenNotUpIsHarmless(t *testing.T) {
 	}
 }
 
-func TestStopDuringContainerCreationIsBusy(t *testing.T) {
-	r := newRig(t)
-	u := r.user("alice")
-	// A start has claimed the workspace but not yet recorded its container.
-	if _, err := r.st.TransitionWorkspace(ctx, u.ID, Sources(EventStart), store.StateStarting, t0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.m.Stop(ctx, u); !errors.Is(err, ErrBusy) {
-		t.Fatalf("err = %v, want ErrBusy", err)
-	}
-}
-
 func TestStopOfAVanishedContainerGoesOffline(t *testing.T) {
 	r := newRig(t)
 	u := r.user("alice")
@@ -490,23 +478,32 @@ func TestStartWithoutProxyWhenNotConfigured(t *testing.T) {
 	}
 }
 
-func TestStartAdoptsItsOwnOrphanedContainer(t *testing.T) {
+func TestStartReplacesItsOwnOrphanedContainer(t *testing.T) {
 	r := newRig(t)
 	u := r.user("alice")
-	// A previous attempt created the container then died before recording it.
+	// A previous attempt created the container (with a password and port block the
+	// database never recorded) then died: it is replaced, not adopted.
 	orphan, err := r.dock.CreateContainer(ctx, docker.ContainerSpec{
-		Name: "berth-ws-alice", Image: "x",
+		Name: "berth-ws-alice", Image: "x", Env: []string{"NEKO_WEBRTC_EPR=30500-30507"},
 		Labels: map[string]string{docker.LabelManaged: "true", docker.LabelUser: "alice"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.mustStart(u)
-	if r.ws(u).ContainerID != orphan {
-		t.Fatalf("container id = %q, want the orphan %q to be adopted", r.ws(u).ContainerID, orphan)
+	ws := r.ws(u)
+	if ws.ContainerID == orphan || ws.ContainerID != r.containerID("alice") {
+		t.Fatalf("container id = %q; the orphan %q must be replaced by a fresh container", ws.ContainerID, orphan)
 	}
-	if info, _ := r.dock.InspectContainer(ctx, orphan); !info.Running {
-		t.Fatal("the adopted container was not started")
+	if _, err := r.dock.InspectContainer(ctx, orphan); !errors.Is(err, docker.ErrNotFound) {
+		t.Fatalf("the orphan still exists: %v", err)
+	}
+	spec, _ := r.dock.Spec(ws.ContainerID)
+	if envValue(spec.Env, envNekoUserPassword) != ws.NekoPassword || spec.UDPPortStart != ws.UDPPortStart {
+		t.Fatalf("the container does not match the database: %+v vs %+v", spec, ws)
+	}
+	if info, _ := r.dock.InspectContainer(ctx, ws.ContainerID); !info.Running {
+		t.Fatal("the replacement was not started")
 	}
 }
 
@@ -517,6 +514,8 @@ func TestStartNeverTouchesAForeignContainerWithItsName(t *testing.T) {
 	for _, labels := range []map[string]string{
 		nil,
 		{docker.LabelManaged: "true", docker.LabelUser: "mallory"}, // another user's
+		{docker.LabelUser: "alice"},                                // names the user but is not Berth's
+		{docker.LabelManaged: "false", docker.LabelUser: "alice"},  // explicitly not managed
 	} {
 		r.dock.Vanish(foreign)
 		foreign, _ = r.dock.CreateContainer(ctx, docker.ContainerSpec{Name: "berth-ws-alice", Image: "other", Labels: labels})

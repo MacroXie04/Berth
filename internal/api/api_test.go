@@ -112,8 +112,8 @@ func (r resp) cookie(name string) *http.Cookie {
 func (r resp) sessionCookie() *http.Cookie { return r.cookie(sessionCookieName) }
 func (r resp) wsCookie() *http.Cookie      { return r.cookie(wsCookieName) }
 
-// do issues a request. body "" means no body; JSON content type is set for
-// non-empty bodies unless the caller overrides it.
+// do issues a request. body "" means no body; the JSON content type is set for
+// every request but GET and HEAD unless the caller overrides it.
 func (e *env) do(method, path, body string, hdr map[string]string, cookies ...*http.Cookie) resp {
 	e.t.Helper()
 	var rd io.Reader
@@ -121,8 +121,8 @@ func (e *env) do(method, path, body string, hdr map[string]string, cookies ...*h
 		rd = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, rd)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
+	if body != "" || (method != "GET" && method != "HEAD") {
+		req.Header.Set("Content-Type", "application/json") // what the SPA always sends
 	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)

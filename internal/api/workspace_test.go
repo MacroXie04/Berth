@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,16 +250,89 @@ func TestNoCapacityIs503(t *testing.T) {
 	}
 }
 
-func TestStopWhileTheContainerIsBeingCreatedIsAConflict(t *testing.T) {
+func TestStopWhileAStartIsCreatingTheContainerIsAConflict(t *testing.T) {
+	e := newWSEnv(t)
+	c := e.registerAndLogin("alice", "correct horse")
+	reached, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	e.dock.SetHook("CreateContainer", func(context.Context) {
+		once.Do(func() { close(reached); <-release })
+	})
+	started := make(chan int, 1)
+	go func() { started <- e.do("POST", "/api/workspace/start", "", nil, c).Code }()
+	<-reached // the start is inside docker create
+	r := e.do("POST", "/api/workspace/stop", "", nil, c)
+	if r.Code != 409 || !strings.Contains(r.Body.String(), "busy") {
+		t.Fatalf("stop during a start: %d %s, want 409", r.Code, r.Body)
+	}
+	close(release)
+	if code := <-started; code != 200 {
+		t.Fatalf("the start: %d", code)
+	}
+}
+
+func TestStopOfAStartThatDiedWithTheOldProcessRecovers(t *testing.T) {
 	e := newWSEnv(t)
 	c := e.registerAndLogin("alice", "correct horse")
 	u, _ := e.store.UserByUsername(ctx0, "alice")
-	// A start has claimed the workspace but has not recorded a container yet.
+	// The previous backend process claimed the row and died: nothing is running.
 	if _, err := e.store.TransitionWorkspace(ctx0, u.ID, []store.State{store.StateOffline}, store.StateStarting, t0); err != nil {
 		t.Fatal(err)
 	}
-	if code := e.do("POST", "/api/workspace/stop", "", nil, c).Code; code != 409 {
-		t.Fatalf("status %d, want 409", code)
+	r := e.do("POST", "/api/workspace/stop", "", nil, c)
+	if r.Code != 200 || wsBody(r)["state"] != "offline" {
+		t.Fatalf("stop: %d %s; the workspace must not stay wedged in 'starting'", r.Code, r.Body)
+	}
+}
+
+// A hostile page on a sibling origin of the same site can make the victim's
+// browser send a cookie-bearing POST, but only as a "simple" request: a form
+// encoding, never JSON. These endpoints have no body, so the content type is the
+// only thing that tells such a request from the SPA's.
+func TestStateChangingRequestsMustBeDeclaredAsJSON(t *testing.T) {
+	e := newWSEnv(t)
+	c := e.registerAndLogin("alice", "correct horse")
+	e.do("POST", "/api/workspace/start", "", nil, c)
+	for _, path := range []string{"/api/workspace/start", "/api/workspace/stop", "/api/workspace/heartbeat", "/api/auth/logout"} {
+		for _, ct := range []string{"application/x-www-form-urlencoded", "text/plain", "multipart/form-data; boundary=x", ""} {
+			r := e.do("POST", path, "", map[string]string{"Content-Type": ct}, c)
+			if r.Code != 415 {
+				t.Errorf("POST %s as %q: %d, want 415", path, ct, r.Code)
+			}
+		}
+	}
+	if st := wsBody(e.do("GET", "/api/workspace", "", nil, c))["state"]; st != "starting" {
+		t.Errorf("a refused request changed the workspace: state = %v", st)
+	}
+	// The session survived the refused logout.
+	if code := e.do("GET", "/api/me", "", nil, c).Code; code != 200 {
+		t.Errorf("/api/me after refused logouts: %d", code)
+	}
+	// Without a session the answer is still 401, not a hint about content types.
+	if code := e.do("POST", "/api/workspace/stop", "", map[string]string{"Content-Type": "text/plain"}).Code; code != 401 {
+		t.Errorf("anonymous: %d, want 401", code)
+	}
+}
+
+func TestHeartbeatRecordsActivity(t *testing.T) {
+	e := newWSEnv(t)
+	c := e.registerAndLogin("alice", "correct horse")
+	e.do("POST", "/api/workspace/start", "", nil, c)
+	id := e.dock.ContainerIDByName("berth-ws-alice")
+	e.dock.SetHealth(id, docker.HealthHealthy)
+	started := wsBody(e.do("GET", "/api/workspace", "", nil, c))["last_active_at"]
+
+	e.clock.Advance(10 * time.Minute)
+	if code := e.do("POST", "/api/workspace/heartbeat", "", nil, c).Code; code != 204 {
+		t.Fatalf("heartbeat: %d", code)
+	}
+	after := wsBody(e.do("GET", "/api/workspace", "", nil, c))["last_active_at"]
+	if after == nil || after == started {
+		t.Fatalf("last_active_at did not move: %v -> %v", started, after)
+	}
+	want := e.clock.Now().UTC().Format(time.RFC3339)
+	if after != want {
+		t.Fatalf("last_active_at = %v, want %v", after, want)
 	}
 }
 

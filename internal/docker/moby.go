@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -62,9 +64,22 @@ func (m *Moby) EnsureNetwork(ctx context.Context, name string, labels map[string
 	// Two requests can race to create the same user's network; the loser's
 	// conflict means it now exists, which is all we wanted.
 	if err != nil && !cerrdefs.IsConflict(err) && !cerrdefs.IsAlreadyExists(err) {
+		if addressSpaceExhausted(err) {
+			return fmt.Errorf("%w: %v", ErrNoAddressSpace, err)
+		}
 		return fmt.Errorf("docker: create network %s: %w", name, err)
 	}
 	return nil
+}
+
+// addressSpaceExhausted recognises the daemon's "no subnet left" refusal. The
+// daemon reports it as a plain invalid-parameter error, so the text is all
+// there is to go on; the phrases are the two it uses (fixed pools, then the
+// overlap search).
+func addressSpaceExhausted(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "fully subnetted") ||
+		strings.Contains(msg, "could not find an available, non-overlapping IPv4 address pool")
 }
 
 func (m *Moby) ManagedNetworks(ctx context.Context) ([]string, error) {
@@ -198,7 +213,31 @@ func (m *Moby) CreateContainer(ctx context.Context, spec ContainerSpec) (string,
 		}
 		return "", fmt.Errorf("docker: create container %s: %w", spec.Name, err)
 	}
+	// A host whose kernel lacks the memory or PIDs controller still gets a 201:
+	// the daemon drops the limit and says so only in the warnings. Berth's limits
+	// are a security invariant, so do not run a container without them.
+	for _, w := range res.Warnings {
+		slog.Warn("docker: container created with warning", "container", spec.Name, "warning", w)
+	}
+	if limitsDiscarded(res.Warnings) {
+		if _, rerr := m.c.ContainerRemove(context.WithoutCancel(ctx), res.ID, client.ContainerRemoveOptions{Force: true}); rerr != nil && !cerrdefs.IsNotFound(rerr) {
+			slog.Error("docker: remove container with discarded limits", "container", spec.Name, "err", rerr)
+		}
+		return "", fmt.Errorf("%w: %s", ErrLimitsNotEnforced, strings.Join(res.Warnings, "; "))
+	}
 	return res.ID, nil
+}
+
+// limitsDiscarded reports whether the daemon said it dropped a limit. "Memory
+// limited without swap" is not one of these: the limit holds, swap is merely
+// uncapped, and many ARM boards lack swap accounting.
+func limitsDiscarded(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, "discarded") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Moby) StartContainer(ctx context.Context, id string) error {
@@ -207,6 +246,14 @@ func (m *Moby) StartContainer(ctx context.Context, id string) error {
 			return nil // already running
 		}
 		if cerrdefs.IsNotFound(err) {
+			// The daemon also answers 404 when the container exists but a network
+			// it references does not (removed and recreated with a new ID while the
+			// workspace was stopped). Only a failed lookup means the container is gone.
+			if _, ierr := m.c.ContainerInspect(ctx, id, client.ContainerInspectOptions{}); ierr == nil {
+				return fmt.Errorf("%w: start %s: %v", ErrStaleContainer, id, err)
+			} else if !cerrdefs.IsNotFound(ierr) {
+				return fmt.Errorf("docker: inspect %s after failed start: %w", id, ierr)
+			}
 			return fmt.Errorf("%w: container %s", ErrNotFound, id)
 		}
 		return fmt.Errorf("docker: start %s: %w", id, err)

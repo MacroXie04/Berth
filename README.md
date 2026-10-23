@@ -38,9 +38,9 @@ Then, through Traefik on port 80:
 
 ```sh
 curl -s -c jar localhost/api/auth/login -H 'Content-Type: application/json' -d '{"username":"alice","password":"correct horse"}'
-curl -s -b jar -X POST localhost/api/workspace/start    # power on; poll GET /api/workspace until "state":"running"
+curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspace/start   # power on; poll GET /api/workspace until "state":"running"
 curl -s -b jar localhost/ws/alice/terminal/             # the ttyd terminal (the cookie jar sends the workspace cookie)
-curl -s -b jar -X POST localhost/api/workspace/stop     # power off; the container and the data volume are kept
+curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspace/stop    # power off; the container and the data volume are kept
 ```
 
 `/api/auth/check` and `/healthz` are internal: Traefik and the container healthcheck use them, and they are deliberately not routed publicly.
@@ -67,7 +67,7 @@ A login sets two `HttpOnly`, `SameSite=Lax` cookies with separate tokens:
 | `berth_session` | `/api` | the API |
 | `berth_ws` | `/ws` | only Traefik's ForwardAuth check |
 
-Traefik forwards the browser's cookies to the workspace container, where code running as the user could read them. Because the API token is never sent under `/ws`, such code cannot call the API.
+Traefik forwards the browser's cookies to the workspace container, where code running as the user could read them. Because the API token is never sent under `/ws`, such code cannot steal it. It is not a full isolation: the workspaces share the site's origin with the API, so a page served by a hostile workspace can still make the visitor's browser call `/api` as that visitor. Serving workspaces from their own origin closes this (CLAUDE.md, decision D4c).
 
 Workspaces do not share a network: each container joins only its own `berth-net-<username>`, and the backend connects Traefik to that network. A workspace therefore cannot reach other workspaces or the backend. Logging out revokes both tokens, but an already-open terminal or browser stream stays connected until it closes.
 

@@ -76,7 +76,7 @@ func (s *Server) workspaceError(w http.ResponseWriter, what string, err error) {
 	case errors.Is(err, workspace.ErrNoCapacity):
 		writeError(w, http.StatusServiceUnavailable, "the server has no capacity for another workspace")
 	case errors.Is(err, workspace.ErrBusy):
-		writeError(w, http.StatusConflict, "the workspace is still being created; try again in a moment")
+		writeError(w, http.StatusConflict, "the workspace is busy starting or stopping; try again in a moment")
 	case docker.IsUnavailable(err):
 		s.Log.Error(what, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "the container service is unavailable")

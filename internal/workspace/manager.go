@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/MacroXie04/Berth/internal/auth"
@@ -18,7 +19,8 @@ var (
 	// ErrNoCapacity means the host has no free UDP port block for another
 	// container.
 	ErrNoCapacity = errors.New("workspace: no capacity for another container")
-	// ErrBusy means another request is in the middle of changing the workspace.
+	// ErrBusy means another request is in the middle of changing the workspace
+	// (a power-off during a start, or a power-on during a power-off).
 	ErrBusy = errors.New("workspace: another operation is in progress")
 	// ErrBadUsername guards the names derived from a username.
 	ErrBadUsername = errors.New("workspace: invalid username")
@@ -61,6 +63,64 @@ type Manager struct {
 	cfg    Config
 	log    *slog.Logger
 	now    func() time.Time
+
+	// flight serialises the operations that change a workspace's container.
+	// Berth is one process, so this in-memory claim is what tells "a start is
+	// running right now" from "a start died with the previous process".
+	flight *flights
+}
+
+const (
+	opStart   = "start"
+	opStop    = "stop"
+	opRecover = "recover"
+)
+
+// flights records which operation, if any, currently owns each user's workspace
+// and counts operations so that an observer can tell one overlapped it.
+type flights struct {
+	mu     sync.Mutex
+	active map[int64]string // user ID -> operation in progress
+	epoch  map[int64]uint64 // user ID -> operations begun so far
+}
+
+func newFlights() *flights {
+	return &flights{active: map[int64]string{}, epoch: map[int64]uint64{}}
+}
+
+// begin claims the user's workspace for op. When another operation owns it, it
+// returns that operation's name and false.
+func (f *flights) begin(id int64, op string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur := f.active[id]; cur != "" {
+		return cur, false
+	}
+	f.active[id] = op
+	f.epoch[id]++
+	return "", true
+}
+
+func (f *flights) end(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.active, id)
+}
+
+// mark is taken before an observation reads anything: the epoch to compare
+// later, and whether an operation owns the workspace right now.
+func (f *flights) mark(id int64) (epoch uint64, busy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.epoch[id], f.active[id] != ""
+}
+
+// unchanged reports that no operation began or is running since mark, so what
+// an observation saw is still the truth about the container.
+func (f *flights) unchanged(id int64, epoch uint64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.active[id] == "" && f.epoch[id] == epoch
 }
 
 // Validate rejects a Config that would misbehave at runtime (a zero timeout
@@ -96,7 +156,7 @@ func NewManager(st store.Store, dc docker.Client, cfg Config, log *slog.Logger, 
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{store: st, docker: dc, cfg: cfg, log: log, now: now}, nil
+	return &Manager{store: st, docker: dc, cfg: cfg, log: log, now: now, flight: newFlights()}, nil
 }
 
 // checkName is defence in depth: usernames are validated at registration, but
@@ -110,33 +170,52 @@ func checkName(username string) error {
 }
 
 // Start powers a workspace on. It is idempotent and safe to call concurrently:
-// the database compare-and-swap lets exactly one caller do the Docker work, and
-// the others just report the state. It returns once the container has been
-// started; readiness (starting -> running) follows from Status as the image's
-// healthcheck passes.
+// one caller per user claims the workspace and does the Docker work, the others
+// just report the state. It returns once the container has been started;
+// readiness (starting -> running) follows from Status as the image's healthcheck
+// passes. A power-on while a power-off is running is refused (ErrBusy).
 func (m *Manager) Start(ctx context.Context, user store.User) (Status, error) {
 	if err := checkName(user.Username); err != nil {
 		return Status{}, err
 	}
+	if other, ok := m.flight.begin(user.ID, opStart); !ok {
+		if other == opStart {
+			return m.Status(ctx, user) // someone is already starting it
+		}
+		return Status{}, ErrBusy
+	}
+	err := m.startClaimed(ctx, user)
+	m.flight.end(user.ID)
+	if err != nil {
+		return Status{}, err
+	}
+	return m.Status(ctx, user)
+}
+
+func (m *Manager) startClaimed(ctx context.Context, user store.User) error {
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.StartTimeout)
 	defer cancel()
 
+	// A start that died with an earlier process left the row at `starting`.
+	if err := m.recoverClaimed(ctx, user); err != nil {
+		return err
+	}
 	now := m.now()
 	ws, err := m.store.TransitionWorkspace(ctx, user.ID, Sources(EventStart), store.StateStarting, now,
 		store.SetActiveAt(now))
 	switch {
 	case errors.Is(err, store.ErrStateConflict):
-		return m.Status(ctx, user) // already starting or running
+		return nil // already starting (container started, waiting for its healthcheck) or running
 	case err != nil:
-		return Status{}, err
+		return err
 	}
 
 	createdID, err := m.bringUp(ctx, user, ws)
 	if err != nil {
 		m.rollback(user, createdID)
-		return Status{}, err
+		return err
 	}
-	return m.Status(ctx, user)
+	return nil
 }
 
 // bringUp does the Docker work of a start. It returns the ID of a container it
@@ -146,6 +225,11 @@ func (m *Manager) bringUp(ctx context.Context, user store.User, ws store.Workspa
 	labels := map[string]string{docker.LabelManaged: "true", docker.LabelUser: user.Username}
 
 	if err := m.docker.EnsureNetwork(ctx, net, labels); err != nil {
+		if errors.Is(err, docker.ErrNoAddressSpace) {
+			m.log.Error("docker has no address space left for another user network; "+
+				"set default-address-pools in daemon.json (README)", "err", err)
+			return "", ErrNoCapacity
+		}
 		return "", err
 	}
 	if m.cfg.TraefikContainer != "" {
@@ -160,14 +244,23 @@ func (m *Manager) bringUp(ctx context.Context, user store.User, ws store.Workspa
 	// A returning user: the container was kept, just start it.
 	if ws.ContainerID != "" {
 		err := m.docker.StartContainer(ctx, ws.ContainerID)
-		if err == nil {
+		switch {
+		case err == nil:
 			return "", nil
-		}
-		if !errors.Is(err, docker.ErrNotFound) {
+		case errors.Is(err, docker.ErrNotFound):
+			m.log.Warn("workspace container vanished while stopped; recreating",
+				"user", user.Username, "container", ws.ContainerID)
+		case errors.Is(err, docker.ErrStaleContainer):
+			// It references something that no longer exists (its network was removed
+			// and recreated). The data is on the volume: replace the container.
+			m.log.Warn("workspace container cannot start; replacing it",
+				"user", user.Username, "container", ws.ContainerID, "err", err)
+			if rerr := m.docker.RemoveContainer(ctx, ws.ContainerID); rerr != nil {
+				return "", rerr
+			}
+		default:
 			return "", err
 		}
-		m.log.Warn("workspace container vanished while stopped; recreating",
-			"user", user.Username, "container", ws.ContainerID)
 	}
 
 	// A new container: it needs its UDP block and the neko password.
@@ -191,23 +284,13 @@ func (m *Manager) bringUp(ctx context.Context, user store.User, ws store.Workspa
 
 	spec := buildSpec(m.cfg, user, ws, userPW, adminPW, udpStart, udpEnd)
 	id, err := m.docker.CreateContainer(ctx, spec)
-	switch {
-	case errors.Is(err, docker.ErrNameInUse):
-		// An earlier attempt died between creating the container and recording
-		// it. Adopt that container if it is ours; never touch anything else.
-		info, ierr := m.docker.InspectContainer(ctx, spec.Name)
-		if ierr != nil {
-			return "", ierr
-		}
-		if info.Labels[docker.LabelManaged] != "true" || info.Labels[docker.LabelUser] != user.Username {
-			return "", fmt.Errorf("container name %s is taken by something Berth did not create", spec.Name)
-		}
-		id = info.ID
-	case err != nil:
-		return "", err
-	default:
-		createdID = id
+	if errors.Is(err, docker.ErrNameInUse) {
+		id, err = m.replaceOrphan(ctx, user, spec)
 	}
+	if err != nil {
+		return "", err
+	}
+	createdID = id
 
 	if _, err := m.store.TransitionWorkspace(ctx, user.ID, []store.State{store.StateStarting}, store.StateStarting,
 		m.now(), store.SetContainerID(id), store.SetNekoPassword(userPW)); err != nil {
@@ -219,16 +302,67 @@ func (m *Manager) bringUp(ctx context.Context, user store.User, ws store.Workspa
 	return createdID, nil
 }
 
+// ownedBy reports whether a container is one Berth created for this user.
+func ownedBy(info docker.ContainerInfo, user store.User) bool {
+	return info.Labels[docker.LabelManaged] == "true" && info.Labels[docker.LabelUser] == user.Username
+}
+
+// replaceOrphan deals with a container that already has the workspace's name
+// although the database records no such container: the leftover of an attempt
+// that died before recording it, or of a wiped database. It was built with a
+// password and UDP block the database no longer matches, and everything worth
+// keeping is on the volume, so it is replaced rather than adopted. Anything Berth
+// did not create is never touched.
+func (m *Manager) replaceOrphan(ctx context.Context, user store.User, spec docker.ContainerSpec) (string, error) {
+	info, err := m.docker.InspectContainer(ctx, spec.Name)
+	if err != nil {
+		return "", err
+	}
+	if !ownedBy(info, user) {
+		return "", fmt.Errorf("container name %s is taken by something Berth did not create", spec.Name)
+	}
+	m.log.Warn("replacing an orphaned workspace container", "user", user.Username, "container", info.ID)
+	if err := m.docker.RemoveContainer(ctx, info.ID); err != nil {
+		return "", err
+	}
+	return m.docker.CreateContainer(ctx, spec)
+}
+
+// sweepOrphan removes a container named for the user's workspace that the
+// database does not record. It reports whether it is certain none is left, which
+// is what makes freeing the UDP block safe: a container that survives keeps its
+// ports published.
+func (m *Manager) sweepOrphan(ctx context.Context, user store.User) bool {
+	info, err := m.docker.InspectContainer(ctx, ContainerName(user.Username))
+	switch {
+	case errors.Is(err, docker.ErrNotFound):
+		return true
+	case err != nil:
+		return false
+	case !ownedBy(info, user):
+		return true // not ours: it neither holds our ports nor is ours to remove
+	}
+	if err := m.docker.RemoveContainer(ctx, info.ID); err != nil {
+		m.log.Error("remove orphaned workspace container", "user", user.Username, "container", info.ID, "err", err)
+		return false
+	}
+	return true
+}
+
 // rollback undoes a failed start. It uses its own short context: the request's
-// may be the very thing that expired.
+// may be the very thing that expired. It frees the UDP block only when it knows
+// no container is left holding it, and it concludes that a kept container is gone
+// only when Docker says so, never because Docker could not be asked.
 func (m *Manager) rollback(user store.User, createdID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	log := m.log.With("user", user.Username)
 
+	createdGone := true
 	if createdID != "" {
 		if err := m.docker.RemoveContainer(ctx, createdID); err != nil {
 			log.Error("rollback: remove container", "container", createdID, "err", err)
+			createdGone = false
 		}
 	}
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
@@ -236,17 +370,27 @@ func (m *Manager) rollback(user store.User, createdID string) {
 		log.Error("rollback: reload workspace", "err", err)
 		return
 	}
+
+	// A container recorded before this attempt: it survives unless Docker says it
+	// does not exist.
+	keptSurvives := false
+	if ws.ContainerID != "" && ws.ContainerID != createdID {
+		_, ierr := m.docker.InspectContainer(ctx, ws.ContainerID)
+		keptSurvives = ierr == nil || !errors.Is(ierr, docker.ErrNotFound)
+	}
+
 	now := m.now()
 	var event Event
 	var opts []store.TransitionOption
-	if ws.ContainerID != "" && createdID != ws.ContainerID {
-		if _, err := m.docker.InspectContainer(ctx, ws.ContainerID); err == nil {
-			// The kept container still exists: the workspace is simply stopped.
-			event, opts = EventExited, []store.TransitionOption{store.SetStoppedAt(now)}
+	if keptSurvives {
+		event, opts = EventExited, []store.TransitionOption{store.SetStoppedAt(now)}
+	} else {
+		// Nothing recorded survives. A create whose reply was lost can still have
+		// left a container of this attempt behind: find it by name.
+		event, opts = EventGone, []store.TransitionOption{store.ClearContainer()}
+		if createdGone && m.sweepOrphan(ctx, user) {
+			opts = append(opts, store.ReleaseUDPRange())
 		}
-	}
-	if event == "" {
-		event, opts = EventGone, []store.TransitionOption{store.ClearContainer(), store.ReleaseUDPRange()}
 	}
 	to, _ := Next(store.StateStarting, event)
 	if _, err := m.store.TransitionWorkspace(ctx, user.ID, []store.State{store.StateStarting}, to, now, opts...); err != nil &&
@@ -255,64 +399,135 @@ func (m *Manager) rollback(user store.User, createdID string) {
 	}
 }
 
+// recoverAbandoned resets a workspace whose Start died with an earlier process
+// (a redeploy or crash between claiming the row and recording a container).
+func (m *Manager) recoverAbandoned(ctx context.Context, user store.User) error {
+	if _, ok := m.flight.begin(user.ID, opRecover); !ok {
+		return nil // an operation is running: not abandoned
+	}
+	defer m.flight.end(user.ID)
+	return m.recoverClaimed(ctx, user)
+}
+
+// recoverClaimed does the work of recoverAbandoned for a caller that already
+// owns the workspace. A `starting` row without a container is abandoned for
+// certain: a live start records the container (or rolls back) before it
+// releases its claim, and nothing is running now.
+func (m *Manager) recoverClaimed(ctx context.Context, user store.User) error {
+	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
+	if err != nil {
+		return err
+	}
+	if ws.State != store.StateStarting || ws.ContainerID != "" {
+		return nil
+	}
+	m.log.Warn("recovering a start that never finished", "user", user.Username)
+	opts := []store.TransitionOption{store.ClearContainer()}
+	if m.sweepOrphan(ctx, user) {
+		opts = append(opts, store.ReleaseUDPRange())
+	}
+	to, _ := Next(store.StateStarting, EventGone)
+	if _, err := m.store.TransitionWorkspace(ctx, user.ID, []store.State{store.StateStarting}, to, m.now(), opts...); err != nil &&
+		!errors.Is(err, store.ErrStateConflict) {
+		return err
+	}
+	return nil
+}
+
 // Stop powers a workspace off, keeping its container and data. It is
-// idempotent: a workspace that is not up is reported as is.
+// idempotent: a workspace that is not up is reported as is. A power-off while a
+// start is still creating the container is refused (ErrBusy): it could not stop
+// a container that is not running yet, and the start would then run it anyway.
 func (m *Manager) Stop(ctx context.Context, user store.User) (Status, error) {
 	if err := checkName(user.Username); err != nil {
 		return Status{}, err
 	}
+	if other, ok := m.flight.begin(user.ID, opStop); !ok {
+		if other == opStop {
+			return m.Status(ctx, user)
+		}
+		return Status{}, ErrBusy
+	}
+	err := m.stopClaimed(ctx, user)
+	m.flight.end(user.ID)
+	if err != nil {
+		return Status{}, err
+	}
+	return m.Status(ctx, user)
+}
+
+func (m *Manager) stopClaimed(ctx context.Context, user store.User) error {
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.StopTimeout+30*time.Second)
 	defer cancel()
 
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
-		return Status{}, err
+		return err
 	}
 	if _, err := Next(ws.State, EventStop); err != nil {
-		return m.Status(ctx, user) // offline or already stopped
+		return nil // offline or already stopped
 	}
 	if ws.ContainerID == "" {
-		return Status{}, ErrBusy // a start is still creating the container
+		// `starting` with no container while no start is running: abandoned.
+		return m.recoverClaimed(ctx, user)
 	}
 
 	event, opts := EventStop, []store.TransitionOption{store.SetStoppedAt(m.now())}
 	if err := m.docker.StopContainer(ctx, ws.ContainerID, m.cfg.StopTimeout); err != nil {
 		if !errors.Is(err, docker.ErrNotFound) {
-			return Status{}, err
+			return err
 		}
 		event, opts = EventGone, []store.TransitionOption{store.ClearContainer(), store.ReleaseUDPRange()}
 	}
 	to, _ := Next(ws.State, event)
 	if _, err := m.store.TransitionWorkspace(ctx, user.ID, Sources(event), to, m.now(), opts...); err != nil &&
 		!errors.Is(err, store.ErrStateConflict) {
-		return Status{}, err
+		return err
 	}
-	return m.Status(ctx, user)
+	return nil
 }
 
 // Status brings the database in line with what Docker reports about the
 // workspace's container, then returns the result with a resource sample when
 // it is running. Errors from Docker are returned only when they leave the
 // database state unknowable; a failed stats sample just omits the numbers.
+//
+// While a start, stop or recovery owns the workspace, or if one began during the
+// observation, Status reports the database row and changes nothing: a container
+// that is merely not running yet is not a crash.
 func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
+	epoch, busy := m.flight.mark(user.ID)
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
 		return Status{}, err
 	}
 	st := Status{Workspace: ws}
+	if busy {
+		return st, nil
+	}
+	if ws.State == store.StateStarting && ws.ContainerID == "" {
+		// Nothing is starting it (it would hold the claim): abandoned.
+		if err := m.recoverAbandoned(ctx, user); err != nil {
+			return Status{}, err
+		}
+		if cur, rerr := m.store.WorkspaceByUserID(ctx, user.ID); rerr == nil {
+			st.Workspace = cur
+		}
+		return st, nil
+	}
 	if ws.ContainerID == "" {
-		return st, nil // nothing to observe (offline, or a start still creating it)
+		return st, nil // offline: nothing to observe
 	}
 
 	info, err := m.docker.InspectContainer(ctx, ws.ContainerID)
 	switch {
 	case errors.Is(err, docker.ErrNotFound):
 		to, nerr := Next(ws.State, EventGone)
-		if nerr != nil {
+		if nerr != nil || !m.flight.unchanged(user.ID, epoch) {
 			return st, nil
 		}
 		m.log.Warn("workspace container is gone", "user", user.Username, "container", ws.ContainerID)
-		updated, terr := m.store.TransitionWorkspace(ctx, user.ID, Sources(EventGone), to, m.now(),
+		updated, terr := m.store.TransitionWorkspace(ctx, user.ID, []store.State{ws.State}, to, m.now(),
 			store.ClearContainer(), store.ReleaseUDPRange())
 		if terr != nil && !errors.Is(terr, store.ErrStateConflict) {
 			return Status{}, terr
@@ -324,9 +539,12 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 	case err != nil:
 		return Status{}, err
 	}
-	st.Health = info.Health
+	if info.Running {
+		// A stopped container keeps its last healthcheck result; it says nothing now.
+		st.Health = info.Health
+	}
 
-	if ev, ok := Observe(ws.State, info); ok {
+	if ev, ok := Observe(ws.State, info); ok && m.flight.unchanged(user.ID, epoch) {
 		to, _ := Next(ws.State, ev)
 		var opts []store.TransitionOption
 		if to == store.StateStopped {

@@ -22,9 +22,10 @@ const (
 // nekoEnv builds the KEY=value list for one workspace container.
 //
 // userPassword is what the web UI logs in with; the frontend gets it from
-// GET /api/workspace. adminPassword is generated per container and handed to
-// no one: the UI user is a regular neko user, and a separate admin secret keeps
-// the two roles distinct.
+// GET /api/workspace. adminPassword is generated per container and never
+// returned by the API: the UI user is a regular neko user. Both are plain
+// environment variables, so code running in the container (same uid as neko)
+// can read either; neither protects anything from the workspace's own user.
 func nekoEnv(cfg Config, username, userPassword, adminPassword string, udpStart, udpEnd int) []string {
 	env := []string{
 		envNekoScreen + "=" + cfg.Resolution,

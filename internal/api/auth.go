@@ -17,8 +17,14 @@ import (
 //
 // Traefik forwards the browser's Cookie header to the workspace container, where
 // code running as the user can read it. Scoping the tokens means the container
-// only ever sees berth_ws, which cannot call the API (and so cannot reach the
-// admin endpoints), while the API token never leaves /api.
+// only ever sees berth_ws, which cannot be used against the API, while the API
+// token never leaves /api: workspace code cannot steal it.
+//
+// That is not the same as workspace code being unable to use it. A page served
+// by a workspace (hostile code can replace ttyd or neko on their ports) shares
+// the Berth origin, so script in it can call /api with the visitor's own
+// cookie. Closing that needs the workspaces on a different origin (CLAUDE.md,
+// decision D4c).
 const (
 	sessionCookieName = "berth_session"
 	sessionCookiePath = "/api"
