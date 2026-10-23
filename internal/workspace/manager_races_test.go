@@ -578,3 +578,27 @@ func TestStaleCrashObservationCannotStopARestartedWorkspace(t *testing.T) {
 		t.Fatalf("state = %s; an observation made before the restart must not stop the running workspace", ws.State)
 	}
 }
+
+// A panic in the middle of an operation (the HTTP layer recovers it and answers
+// 500) must release the user's claim, or every later start and stop is refused.
+func TestAPanicDoesNotWedgeTheWorkspace(t *testing.T) {
+	r := newRig(t)
+	u := r.user("alice")
+	armed := true
+	r.dock.SetHook("CreateContainer", func(context.Context) {
+		if armed {
+			armed = false
+			panic("boom")
+		}
+	})
+	func() {
+		defer func() { _ = recover() }()
+		r.m.Start(ctx, u)
+	}()
+	// The row is left at `starting` (the rollback never ran); the next request
+	// recovers it instead of being told the workspace is busy.
+	if s, err := r.m.Stop(ctx, u); err != nil || s.Workspace.State != store.StateOffline {
+		t.Fatalf("Stop after a panicked start = %v, %v", s.Workspace.State, err)
+	}
+	r.mustStart(u)
+}

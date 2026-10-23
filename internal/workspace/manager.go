@@ -184,15 +184,17 @@ func (m *Manager) Start(ctx context.Context, user store.User) (Status, error) {
 		}
 		return Status{}, ErrBusy
 	}
-	err := m.startClaimed(ctx, user)
-	m.flight.end(user.ID)
-	if err != nil {
+	if err := m.startClaimed(ctx, user); err != nil {
 		return Status{}, err
 	}
 	return m.Status(ctx, user)
 }
 
+// startClaimed does a start with the workspace claimed and releases the claim
+// when it returns, however it returns (a panic must not wedge the user until the
+// process restarts).
 func (m *Manager) startClaimed(ctx context.Context, user store.User) error {
+	defer m.flight.end(user.ID)
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.StartTimeout)
 	defer cancel()
 
@@ -448,15 +450,16 @@ func (m *Manager) Stop(ctx context.Context, user store.User) (Status, error) {
 		}
 		return Status{}, ErrBusy
 	}
-	err := m.stopClaimed(ctx, user)
-	m.flight.end(user.ID)
-	if err != nil {
+	if err := m.stopClaimed(ctx, user); err != nil {
 		return Status{}, err
 	}
 	return m.Status(ctx, user)
 }
 
+// stopClaimed does a stop with the workspace claimed and releases the claim when
+// it returns, however it returns.
 func (m *Manager) stopClaimed(ctx context.Context, user store.User) error {
+	defer m.flight.end(user.ID)
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.StopTimeout+30*time.Second)
 	defer cancel()
 

@@ -79,7 +79,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	go keepProxyAttached(ctx, workspaces, log, time.Minute)
+	go keepProxyAttached(ctx, workspaces, log, cfg.ProxyAttachInterval)
 
 	srv := api.New(api.Deps{
 		Store:             st,

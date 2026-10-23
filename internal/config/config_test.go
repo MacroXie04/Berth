@@ -37,6 +37,7 @@ func TestDefaults(t *testing.T) {
 		PidsLimit:            2048,
 		StopTimeout:          15 * time.Second,
 		StartTimeout:         45 * time.Second,
+		ProxyAttachInterval:  10 * time.Second,
 	}
 	if cfg != want {
 		t.Fatalf("defaults:\n got %+v\nwant %+v", cfg, want)
@@ -153,6 +154,7 @@ func TestWorkspaceOverrides(t *testing.T) {
 		"BERTH_PIDS_LIMIT":              "4096",
 		"BERTH_STOP_TIMEOUT":            "30s",
 		"BERTH_START_TIMEOUT":           "2m",
+		"BERTH_PROXY_ATTACH_INTERVAL":   "30s",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +162,8 @@ func TestWorkspaceOverrides(t *testing.T) {
 	if cfg.WorkspaceImage != "registry.example.com/team/ws:1.2.3" || cfg.TraefikContainer != "proxy_1" ||
 		cfg.TraefikEntrypoint != "websecure" || cfg.UDPPortMin != 40000 || cfg.UDPPortMax != 40063 ||
 		cfg.UDPPortsPerWorkspace != 16 || cfg.Resolution != "1920x1080@60" || cfg.PublicIP != "203.0.113.7" ||
-		cfg.ShmSizeMB != 1024 || cfg.PidsLimit != 4096 || cfg.StopTimeout != 30*time.Second || cfg.StartTimeout != 2*time.Minute {
+		cfg.ShmSizeMB != 1024 || cfg.PidsLimit != 4096 || cfg.StopTimeout != 30*time.Second || cfg.StartTimeout != 2*time.Minute ||
+		cfg.ProxyAttachInterval != 30*time.Second {
 		t.Fatalf("workspace overrides not applied: %+v", cfg)
 	}
 	if cfg, err := Load(env(map[string]string{"BERTH_PUBLIC_IP": "2001:db8::1"})); err != nil || cfg.PublicIP != "2001:db8::1" {
@@ -179,33 +182,35 @@ func TestProxyAttachmentCanBeDisabled(t *testing.T) {
 // label keys, so metacharacters must be refused at startup.
 func TestWorkspaceValuesAreValidated(t *testing.T) {
 	bad := map[string]map[string]string{
-		"image with space":         {"BERTH_WORKSPACE_IMAGE": "a b"},
-		"image with backtick":      {"BERTH_WORKSPACE_IMAGE": "x`y"},
-		"image with comma":         {"BERTH_WORKSPACE_IMAGE": "a,b"},
-		"container with space":     {"BERTH_TRAEFIK_CONTAINER": "a b"},
-		"container with slash":     {"BERTH_TRAEFIK_CONTAINER": "../x"},
-		"container starting dash":  {"BERTH_TRAEFIK_CONTAINER": "-x"},
-		"entrypoint with comma":    {"BERTH_TRAEFIK_ENTRYPOINT": "web,admin"},
-		"entrypoint with backtick": {"BERTH_TRAEFIK_ENTRYPOINT": "we`b"},
-		"entrypoint with dot":      {"BERTH_TRAEFIK_ENTRYPOINT": "web.x"},
-		"resolution no fps":        {"BERTH_RESOLUTION": "1280x720"},
-		"resolution garbage":       {"BERTH_RESOLUTION": "big"},
-		"resolution zero fps":      {"BERTH_RESOLUTION": "1280x720@0"},
-		"resolution leading zero":  {"BERTH_RESOLUTION": "01280x720@30"},
-		"public ip not an ip":      {"BERTH_PUBLIC_IP": "example.com"},
-		"public ip with port":      {"BERTH_PUBLIC_IP": "1.2.3.4:80"},
-		"udp min below 1024":       {"BERTH_UDP_PORT_MIN": "80"},
-		"udp max above 65535":      {"BERTH_UDP_PORT_MAX": "70000"},
-		"udp range too small":      {"BERTH_UDP_PORT_MIN": "30000", "BERTH_UDP_PORT_MAX": "30003"},
-		"udp inverted":             {"BERTH_UDP_PORT_MIN": "31000", "BERTH_UDP_PORT_MAX": "30000"},
-		"zero ports per workspace": {"BERTH_UDP_PORTS_PER_WORKSPACE": "0"},
-		"shm too small":            {"BERTH_SHM_MB": "10"},
-		"pids too small":           {"BERTH_PIDS_LIMIT": "1"},
-		"pids absurd":              {"BERTH_PIDS_LIMIT": "99999999"},
-		"stop timeout too short":   {"BERTH_STOP_TIMEOUT": "100ms"},
-		"stop timeout too long":    {"BERTH_STOP_TIMEOUT": "1h"},
-		"start timeout too short":  {"BERTH_START_TIMEOUT": "1s"},
-		"start timeout not a time": {"BERTH_START_TIMEOUT": "soon"},
+		"image with space":          {"BERTH_WORKSPACE_IMAGE": "a b"},
+		"image with backtick":       {"BERTH_WORKSPACE_IMAGE": "x`y"},
+		"image with comma":          {"BERTH_WORKSPACE_IMAGE": "a,b"},
+		"container with space":      {"BERTH_TRAEFIK_CONTAINER": "a b"},
+		"container with slash":      {"BERTH_TRAEFIK_CONTAINER": "../x"},
+		"container starting dash":   {"BERTH_TRAEFIK_CONTAINER": "-x"},
+		"entrypoint with comma":     {"BERTH_TRAEFIK_ENTRYPOINT": "web,admin"},
+		"entrypoint with backtick":  {"BERTH_TRAEFIK_ENTRYPOINT": "we`b"},
+		"entrypoint with dot":       {"BERTH_TRAEFIK_ENTRYPOINT": "web.x"},
+		"resolution no fps":         {"BERTH_RESOLUTION": "1280x720"},
+		"resolution garbage":        {"BERTH_RESOLUTION": "big"},
+		"resolution zero fps":       {"BERTH_RESOLUTION": "1280x720@0"},
+		"resolution leading zero":   {"BERTH_RESOLUTION": "01280x720@30"},
+		"public ip not an ip":       {"BERTH_PUBLIC_IP": "example.com"},
+		"public ip with port":       {"BERTH_PUBLIC_IP": "1.2.3.4:80"},
+		"udp min below 1024":        {"BERTH_UDP_PORT_MIN": "80"},
+		"udp max above 65535":       {"BERTH_UDP_PORT_MAX": "70000"},
+		"udp range too small":       {"BERTH_UDP_PORT_MIN": "30000", "BERTH_UDP_PORT_MAX": "30003"},
+		"udp inverted":              {"BERTH_UDP_PORT_MIN": "31000", "BERTH_UDP_PORT_MAX": "30000"},
+		"zero ports per workspace":  {"BERTH_UDP_PORTS_PER_WORKSPACE": "0"},
+		"shm too small":             {"BERTH_SHM_MB": "10"},
+		"pids too small":            {"BERTH_PIDS_LIMIT": "1"},
+		"pids absurd":               {"BERTH_PIDS_LIMIT": "99999999"},
+		"stop timeout too short":    {"BERTH_STOP_TIMEOUT": "100ms"},
+		"stop timeout too long":     {"BERTH_STOP_TIMEOUT": "1h"},
+		"start timeout too short":   {"BERTH_START_TIMEOUT": "1s"},
+		"start timeout not a time":  {"BERTH_START_TIMEOUT": "soon"},
+		"attach interval too short": {"BERTH_PROXY_ATTACH_INTERVAL": "500ms"},
+		"attach interval too long":  {"BERTH_PROXY_ATTACH_INTERVAL": "1h"},
 	}
 	for name, e := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -218,7 +223,7 @@ func TestWorkspaceValuesAreValidated(t *testing.T) {
 	ok := map[string]string{
 		"BERTH_UDP_PORT_MIN": "1024", "BERTH_UDP_PORT_MAX": "65535", "BERTH_UDP_PORTS_PER_WORKSPACE": "64512",
 		"BERTH_SHM_MB": "64", "BERTH_PIDS_LIMIT": "64",
-		"BERTH_STOP_TIMEOUT": "1s", "BERTH_START_TIMEOUT": "5s",
+		"BERTH_STOP_TIMEOUT": "1s", "BERTH_START_TIMEOUT": "5s", "BERTH_PROXY_ATTACH_INTERVAL": "2s",
 	}
 	if _, err := Load(env(ok)); err != nil {
 		t.Fatalf("boundary values rejected: %v", err)

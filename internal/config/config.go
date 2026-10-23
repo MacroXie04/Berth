@@ -40,6 +40,10 @@ type Config struct {
 	PidsLimit            int           // BERTH_PIDS_LIMIT
 	StopTimeout          time.Duration // BERTH_STOP_TIMEOUT
 	StartTimeout         time.Duration // BERTH_START_TIMEOUT
+	// ProxyAttachInterval is how often Traefik is re-attached to the user
+	// networks; it bounds how long workspaces are unreachable after Traefik is
+	// recreated.
+	ProxyAttachInterval time.Duration // BERTH_PROXY_ATTACH_INTERVAL
 }
 
 // noProxy is the BERTH_TRAEFIK_CONTAINER value that turns proxy attachment off.
@@ -96,6 +100,7 @@ func Load(getenv func(string) string) (Config, error) {
 		PidsLimit:            l.integer("BERTH_PIDS_LIMIT", 2048),
 		StopTimeout:          l.duration("BERTH_STOP_TIMEOUT", 15*time.Second),
 		StartTimeout:         l.duration("BERTH_START_TIMEOUT", 45*time.Second),
+		ProxyAttachInterval:  l.duration("BERTH_PROXY_ATTACH_INTERVAL", 10*time.Second),
 	}
 	if cfg.TraefikContainer == noProxy {
 		cfg.TraefikContainer = ""
@@ -151,6 +156,9 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if cfg.StartTimeout < 5*time.Second || cfg.StartTimeout > 10*time.Minute {
 		l.fail("BERTH_START_TIMEOUT must be between 5s and 10m")
+	}
+	if cfg.ProxyAttachInterval < 2*time.Second || cfg.ProxyAttachInterval > 10*time.Minute {
+		l.fail("BERTH_PROXY_ATTACH_INTERVAL must be between 2s and 10m")
 	}
 
 	if err := errors.Join(l.errs...); err != nil {
