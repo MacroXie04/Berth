@@ -14,6 +14,13 @@ var (
 	ErrNotFound = errors.New("store: not found")
 	// ErrUsernameTaken is returned by CreateUser on a duplicate username.
 	ErrUsernameTaken = errors.New("store: username already taken")
+	// ErrStateConflict is returned by TransitionWorkspace when the workspace
+	// exists but is not in any of the expected states: another request got
+	// there first.
+	ErrStateConflict = errors.New("store: workspace state conflict")
+	// ErrNoPortsFree is returned by AllocateUDPRange when the configured range
+	// has no free block left.
+	ErrNoPortsFree = errors.New("store: no free UDP port range")
 )
 
 // State is a workspace's position in the lifecycle state machine.
@@ -46,14 +53,24 @@ type Workspace struct {
 	LastActiveAt  *time.Time
 	LastStoppedAt *time.Time
 	UpdatedAt     time.Time
+
+	// UDPPortStart..UDPPortEnd (inclusive) is the container's published WebRTC
+	// range; both are zero while no container holds one.
+	UDPPortStart int
+	UDPPortEnd   int
+	// NekoPassword configures the neko web UI; empty until the first container
+	// is created.
+	NekoPassword string
 }
 
-// Session is a login session. TokenHash is the hex sha256 of the cookie token.
+// Session is a login session. TokenHash and WSTokenHash are the hex sha256 of
+// the two cookie tokens (API scope and workspace scope).
 type Session struct {
-	TokenHash string
-	UserID    int64
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	TokenHash   string
+	WSTokenHash string
+	UserID      int64
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 // NewUser carries what registration needs to create a user and its workspace.
@@ -79,8 +96,25 @@ type Store interface {
 	// SessionUser returns the user owning the session, or ErrNotFound when
 	// the session is unknown or expired at now.
 	SessionUser(ctx context.Context, tokenHash string, now time.Time) (User, error)
+	// WorkspaceSessionUser is SessionUser for the workspace-scoped token.
+	WorkspaceSessionUser(ctx context.Context, wsTokenHash string, now time.Time) (User, error)
+	// DeleteSession revokes the session holding this API token (both tokens die).
 	DeleteSession(ctx context.Context, tokenHash string) error
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int64, error)
+
+	// TransitionWorkspace atomically moves the workspace to state `to` if and
+	// only if it is currently in one of `from` (compare-and-swap), applying the
+	// options in the same statement. It returns ErrStateConflict when the
+	// workspace is in another state and ErrNotFound when it does not exist.
+	// from == [to] is allowed: it just updates fields.
+	TransitionWorkspace(ctx context.Context, userID int64, from []State, to State, now time.Time,
+		opts ...TransitionOption) (Workspace, error)
+	// AllocateUDPRange gives the workspace a block of `size` ports inside
+	// [min, max] that overlaps no other workspace's block, or returns the block
+	// it already holds. ErrNoPortsFree when none fits.
+	AllocateUDPRange(ctx context.Context, userID int64, min, max, size int, now time.Time) (start, end int, err error)
+	// TouchLastActive records activity for a starting or running workspace.
+	TouchLastActive(ctx context.Context, userID int64, now time.Time) error
 
 	Close() error
 }

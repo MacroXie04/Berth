@@ -99,13 +99,24 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 // spurious logout.
 var errNoSession = errors.New("no valid session")
 
-// sessionUser resolves the request's session cookie to a user.
+// sessionUser resolves the request's API session cookie to a user.
 func (s *Server) sessionUser(r *http.Request) (store.User, error) {
-	c, err := r.Cookie(sessionCookieName)
+	return s.cookieUser(r, sessionCookieName, s.Store.SessionUser)
+}
+
+// workspaceUser resolves the workspace-scoped cookie, which only the ForwardAuth
+// check accepts.
+func (s *Server) workspaceUser(r *http.Request) (store.User, error) {
+	return s.cookieUser(r, wsCookieName, s.Store.WorkspaceSessionUser)
+}
+
+func (s *Server) cookieUser(r *http.Request, cookie string,
+	lookup func(context.Context, string, time.Time) (store.User, error)) (store.User, error) {
+	c, err := r.Cookie(cookie)
 	if err != nil || c.Value == "" {
 		return store.User{}, errNoSession
 	}
-	u, err := s.Store.SessionUser(r.Context(), auth.HashToken(c.Value), s.Now())
+	u, err := lookup(r.Context(), auth.HashToken(c.Value), s.Now())
 	if errors.Is(err, store.ErrNotFound) {
 		return store.User{}, errNoSession
 	}

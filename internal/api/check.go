@@ -21,7 +21,7 @@ import (
 //
 // Everything unexpected fails closed.
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
-	user, err := s.sessionUser(r)
+	user, err := s.workspaceUser(r)
 	switch {
 	case errors.Is(err, errNoSession):
 		writeError(w, http.StatusUnauthorized, "not logged in")

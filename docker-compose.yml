@@ -4,13 +4,17 @@
 #   docker compose up -d --build
 #
 # Workspace containers are not defined here: the backend creates them on demand
-# (Milestone 2) and Traefik discovers them through their labels. Their routers
-# reference the ForwardAuth middleware as berth-auth@file.
+# and Traefik discovers them through their labels. Their routers reference the
+# ForwardAuth middleware as berth-auth@file. Each workspace lives on its own
+# private network; the backend connects Traefik to it. Workspaces never join
+# berth-proxy, so they cannot reach each other or the backend.
 name: berth
 
 services:
   traefik:
     image: traefik:v3.7 # >= 3.6.1 is required to talk to Docker Engine 29
+    # A fixed name: the backend attaches this container to every user network.
+    container_name: berth-traefik
     restart: unless-stopped
     command:
       - --providers.docker=true
@@ -64,8 +68,20 @@ services:
       # Fixed by the container layout, so they win over anything in .env.
       BERTH_LISTEN_ADDR: ":8080"
       BERTH_DB_PATH: /data/berth.db
+      BERTH_TRAEFIK_CONTAINER: berth-traefik
     volumes:
       - berth-state:/data
+      # Root-equivalent access to the host: the backend creates and removes
+      # containers. It runs as an unprivileged user, so it joins the socket's
+      # group instead of running as root.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the group id of /var/run/docker.sock: stat -c %g /var/run/docker.sock}"
+    depends_on:
+      traefik:
+        condition: service_healthy
+      workspace-image:
+        condition: service_completed_successfully
     networks:
       - berth-proxy
     labels:
@@ -84,6 +100,17 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  # Builds the workspace image (berth/workspace:latest) as part of `up --build`
+  # and exits at once: the backend creates the actual workspace containers.
+  workspace-image:
+    build: ./images/workspace
+    # "berth/workspace" is the name the spec fixes. That Docker Hub namespace is
+    # not ours, so the image is only ever built locally, never pulled.
+    image: berth/workspace:latest
+    pull_policy: build
+    entrypoint: ["true"]
+    restart: "no"
 
 networks:
   berth-proxy:

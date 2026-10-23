@@ -1,0 +1,16 @@
+#!/bin/sh
+# Launcher for neko's supervisord "chromium" program (the Dockerfile points the
+# program's command= at this script). Runs as the workspace user.
+#
+# Chromium records "<hostname>-<pid>" in <profile>/SingletonLock. The profile
+# lives on a persistent volume while the hostname of a new container (= its id)
+# changes, so after docker kill / a crash / "docker rm" of a running container
+# the stale lock makes Chromium refuse to open the profile ("profile appears to
+# be in use by another computer"). Only this supervisord program starts Chromium
+# in this container and it is not running yet, so the leftovers are always stale.
+set -eu
+
+profile="${HOME:-/home/user}/.config/chromium"
+rm -f -- "$profile/SingletonLock" "$profile/SingletonCookie" "$profile/SingletonSocket"
+
+exec /usr/bin/chromium "$@"

@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -23,7 +25,10 @@ import (
 	"github.com/MacroXie04/Berth/internal/store"
 )
 
-var t0 = time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+var (
+	t0   = time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	ctx0 = context.Background()
+)
 
 const testTTL = 24 * time.Hour
 
@@ -94,14 +99,18 @@ func (r resp) json() map[string]any {
 	return m
 }
 
-func (r resp) sessionCookie() *http.Cookie {
+func (r resp) cookie(name string) *http.Cookie {
 	for _, c := range r.Result().Cookies() {
-		if c.Name == sessionCookieName {
+		if c.Name == name {
 			return c
 		}
 	}
 	return nil
 }
+
+// sessionCookie is the API-scoped cookie; wsCookie the workspace-scoped one.
+func (r resp) sessionCookie() *http.Cookie { return r.cookie(sessionCookieName) }
+func (r resp) wsCookie() *http.Cookie      { return r.cookie(wsCookieName) }
 
 // do issues a request. body "" means no body; JSON content type is set for
 // non-empty bodies unless the caller overrides it.
@@ -136,26 +145,39 @@ func (e *env) register(user, pw string) resp {
 	return e.do("POST", "/api/auth/register", creds(user, pw), nil)
 }
 
-// login registers nothing; it logs in and returns the session cookie.
-func (e *env) login(user, pw string) *http.Cookie {
+// loginBoth registers nothing; it logs in and returns both session cookies.
+func (e *env) loginBoth(user, pw string) (api, ws *http.Cookie) {
 	e.t.Helper()
 	r := e.do("POST", "/api/auth/login", creds(user, pw), nil)
 	if r.Code != 200 {
 		e.t.Fatalf("login %s: %d %s", user, r.Code, r.Body)
 	}
-	c := r.sessionCookie()
-	if c == nil {
-		e.t.Fatal("login set no session cookie")
+	api, ws = r.sessionCookie(), r.wsCookie()
+	if api == nil || ws == nil {
+		e.t.Fatalf("login must set both cookies: api=%v ws=%v", api, ws)
 	}
-	return c
+	return api, ws
+}
+
+// login returns the API cookie, which is what every /api/* test needs.
+func (e *env) login(user, pw string) *http.Cookie {
+	e.t.Helper()
+	api, _ := e.loginBoth(user, pw)
+	return api
 }
 
 func (e *env) registerAndLogin(user, pw string) *http.Cookie {
 	e.t.Helper()
+	api, _ := e.registerAndLoginBoth(user, pw)
+	return api
+}
+
+func (e *env) registerAndLoginBoth(user, pw string) (api, ws *http.Cookie) {
+	e.t.Helper()
 	if r := e.register(user, pw); r.Code != 201 {
 		e.t.Fatalf("register %s: %d %s", user, r.Code, r.Body)
 	}
-	return e.login(user, pw)
+	return e.loginBoth(user, pw)
 }
 
 func TestHealthz(t *testing.T) {
@@ -300,15 +322,23 @@ func TestLogin(t *testing.T) {
 	if r.Code != 200 {
 		t.Fatalf("status %d: %s", r.Code, r.Body)
 	}
-	c := r.sessionCookie()
-	if c == nil || len(c.Value) != 43 {
-		t.Fatalf("session cookie = %+v", c)
+	c, wc := r.sessionCookie(), r.wsCookie()
+	if c == nil || len(c.Value) != 43 || wc == nil || len(wc.Value) != 43 {
+		t.Fatalf("cookies = %+v / %+v", c, wc)
 	}
-	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.Secure {
-		t.Errorf("cookie attributes wrong: %+v", c)
+	if c.Value == wc.Value {
+		t.Fatal("the API and workspace tokens must be independent")
 	}
-	if c.MaxAge != int(testTTL.Seconds()) || !c.Expires.Equal(t0.Add(testTTL)) {
-		t.Errorf("cookie lifetime: MaxAge=%d Expires=%v", c.MaxAge, c.Expires)
+	for _, tc := range []struct {
+		ck   *http.Cookie
+		path string
+	}{{c, "/api"}, {wc, "/ws"}} {
+		if !tc.ck.HttpOnly || tc.ck.SameSite != http.SameSiteLaxMode || tc.ck.Path != tc.path || tc.ck.Secure {
+			t.Errorf("%s attributes wrong: %+v", tc.ck.Name, tc.ck)
+		}
+		if tc.ck.MaxAge != int(testTTL.Seconds()) || !tc.ck.Expires.Equal(t0.Add(testTTL)) {
+			t.Errorf("%s lifetime: MaxAge=%d Expires=%v", tc.ck.Name, tc.ck.MaxAge, tc.ck.Expires)
+		}
 	}
 	if u := r.json()["user"].(map[string]any); u["username"] != "alice" {
 		t.Errorf("body: %s", r.Body)
@@ -321,14 +351,20 @@ func TestLogin(t *testing.T) {
 	if _, err := e.store.SessionUser(context.Background(), c.Value, t0); !errors.Is(err, store.ErrNotFound) {
 		t.Error("session is retrievable by the raw token: token stored unhashed?")
 	}
+	if u, _ := e.store.WorkspaceSessionUser(context.Background(), auth.HashToken(wc.Value), t0); u.Username != "alice" {
+		t.Errorf("workspace token not stored under its hash: %+v", u)
+	}
+	if _, err := e.store.WorkspaceSessionUser(context.Background(), wc.Value, t0); !errors.Is(err, store.ErrNotFound) {
+		t.Error("workspace token is retrievable raw: stored unhashed?")
+	}
 }
 
 func TestLoginSecureCookieWhenConfigured(t *testing.T) {
 	e := newEnv(t, func(d *Deps) { d.CookieSecure = true })
 	e.register("alice", "correct horse")
-	c := e.login("alice", "correct horse")
-	if !c.Secure {
-		t.Error("cookie should be Secure when BERTH_COOKIE_SECURE=true")
+	c, wc := e.loginBoth("alice", "correct horse")
+	if !c.Secure || !wc.Secure {
+		t.Error("both cookies should be Secure when BERTH_COOKIE_SECURE=true")
 	}
 }
 
@@ -402,22 +438,23 @@ func TestMultipleSessionsCoexist(t *testing.T) {
 
 func TestLogout(t *testing.T) {
 	e := newEnv(t)
-	c := e.registerAndLogin("alice", "correct horse")
+	c, wc := e.registerAndLoginBoth("alice", "correct horse")
 
 	r := e.do("POST", "/api/auth/logout", "", nil, c)
 	if r.Code != 204 {
 		t.Fatalf("status %d", r.Code)
 	}
-	cleared := r.sessionCookie()
-	if cleared == nil || cleared.MaxAge >= 0 || cleared.Value != "" {
-		t.Errorf("cookie not cleared: %+v", cleared)
+	for _, cleared := range []*http.Cookie{r.sessionCookie(), r.wsCookie()} {
+		if cleared == nil || cleared.MaxAge >= 0 || cleared.Value != "" {
+			t.Errorf("cookie not cleared: %+v", cleared)
+		}
 	}
-	// The old token must be dead server-side, not merely forgotten by the browser.
+	// The old tokens must be dead server-side, not merely forgotten by the browser.
 	if e.do("GET", "/api/me", "", nil, c).Code != 401 {
 		t.Error("session still valid after logout (replayed cookie)")
 	}
-	if code := e.do("GET", "/api/auth/check", "", map[string]string{"X-Forwarded-Uri": "/ws/alice/terminal"}, c).Code; code != 401 {
-		t.Errorf("ForwardAuth accepted a logged-out session: %d", code)
+	if code := e.do("GET", "/api/auth/check", "", map[string]string{"X-Forwarded-Uri": "/ws/alice/terminal"}, wc).Code; code != 401 {
+		t.Errorf("ForwardAuth accepted the workspace token of a logged-out session: %d", code)
 	}
 	// Logging out with no session is harmless.
 	if r := e.do("POST", "/api/auth/logout", "", nil); r.Code != 204 {
@@ -453,15 +490,15 @@ func TestMe(t *testing.T) {
 
 func TestSessionExpiry(t *testing.T) {
 	e := newEnv(t)
-	c := e.registerAndLogin("alice", "correct horse")
+	c, wc := e.registerAndLoginBoth("alice", "correct horse")
 	fwd := map[string]string{"X-Forwarded-Uri": "/ws/alice/terminal"}
 
 	e.clock.Advance(testTTL - time.Second)
-	if e.do("GET", "/api/me", "", nil, c).Code != 200 || e.do("GET", "/api/auth/check", "", fwd, c).Code != 200 {
+	if e.do("GET", "/api/me", "", nil, c).Code != 200 || e.do("GET", "/api/auth/check", "", fwd, wc).Code != 200 {
 		t.Fatal("session should still be valid just before expiry")
 	}
 	e.clock.Advance(time.Second)
-	if e.do("GET", "/api/me", "", nil, c).Code != 401 || e.do("GET", "/api/auth/check", "", fwd, c).Code != 401 {
+	if e.do("GET", "/api/me", "", nil, c).Code != 401 || e.do("GET", "/api/auth/check", "", fwd, wc).Code != 401 {
 		t.Fatal("session should be expired at its expiry instant")
 	}
 }
@@ -482,8 +519,8 @@ func TestLoginPurgesExpiredSessions(t *testing.T) {
 
 func TestCheck(t *testing.T) {
 	e := newEnv(t)
-	alice := e.registerAndLogin("alice", "correct horse")
-	bob := e.registerAndLogin("bob", "battery staple")
+	aliceAPI, alice := e.registerAndLoginBoth("alice", "correct horse")
+	_, bob := e.registerAndLoginBoth("bob", "battery staple")
 
 	cases := []struct {
 		name    string
@@ -498,7 +535,10 @@ func TestCheck(t *testing.T) {
 		{"other user's browser", "/ws/bob/browser", []*http.Cookie{alice}, 403},
 		{"bob owns bob's", "/ws/bob/terminal", []*http.Cookie{bob}, 200},
 		{"no cookie", "/ws/alice/terminal", nil, 401},
-		{"garbage cookie", "/ws/alice/terminal", []*http.Cookie{{Name: sessionCookieName, Value: "x"}}, 401},
+		{"garbage cookie", "/ws/alice/terminal", []*http.Cookie{{Name: wsCookieName, Value: "x"}}, 401},
+		{"the API cookie is not a workspace credential", "/ws/alice/terminal", []*http.Cookie{aliceAPI}, 401},
+		{"API token smuggled in the workspace cookie", "/ws/alice/terminal",
+			[]*http.Cookie{{Name: wsCookieName, Value: aliceAPI.Value}}, 401},
 		{"no cookie and bad path is still 401", "/nonsense", nil, 401},
 		{"traversal to other user", "/ws/alice/../bob/terminal", []*http.Cookie{alice}, 403},
 		{"encoded traversal", "/ws/alice/%2e%2e/bob/terminal", []*http.Cookie{alice}, 403},
@@ -526,7 +566,7 @@ func TestCheck(t *testing.T) {
 // only X-Forwarded-Uri (which Traefik overwrites) counts.
 func TestCheckIgnoresOtherHeaders(t *testing.T) {
 	e := newEnv(t)
-	alice := e.registerAndLogin("alice", "correct horse")
+	_, alice := e.registerAndLoginBoth("alice", "correct horse")
 	e.registerAndLogin("bob", "battery staple")
 	r := e.do("GET", "/api/auth/check?user=alice", "", map[string]string{
 		"X-Forwarded-Uri": "/ws/bob/terminal",
@@ -545,6 +585,10 @@ func (failingStore) SessionUser(context.Context, string, time.Time) (store.User,
 	return store.User{}, errors.New("database is on fire")
 }
 
+func (failingStore) WorkspaceSessionUser(context.Context, string, time.Time) (store.User, error) {
+	return store.User{}, errors.New("database is on fire")
+}
+
 // An infrastructure error must be a 5xx, never a 401: a 401 would make the UI
 // believe the user logged out; and ForwardAuth must still fail closed.
 func TestStoreErrorsAreServerErrorsAndFailClosed(t *testing.T) {
@@ -553,7 +597,8 @@ func TestStoreErrorsAreServerErrorsAndFailClosed(t *testing.T) {
 	if code := e.do("GET", "/api/me", "", nil, c).Code; code != 500 {
 		t.Errorf("/api/me status %d, want 500", code)
 	}
-	r := e.do("GET", "/api/auth/check", "", map[string]string{"X-Forwarded-Uri": "/ws/alice/terminal"}, c)
+	wc := &http.Cookie{Name: wsCookieName, Value: "whatever"}
+	r := e.do("GET", "/api/auth/check", "", map[string]string{"X-Forwarded-Uri": "/ws/alice/terminal"}, wc)
 	if r.Code != 500 {
 		t.Errorf("/api/auth/check status %d, want 500", r.Code)
 	}
@@ -605,19 +650,21 @@ type panicStore struct{ store.Store }
 
 func (panicStore) UserByUsername(context.Context, string) (store.User, error) { panic("boom") }
 
-// The cookie that clears a session must carry the same Path as the one that set
-// it, or the browser keeps the old cookie. The other attributes are pinned too.
+// A cookie that clears a session only replaces the stored one if Name and Path
+// match what login set, so each clearing cookie must mirror its original.
 func TestLogoutCookieAttributes(t *testing.T) {
 	for _, secure := range []bool{false, true} {
 		e := newEnv(t, func(d *Deps) { d.CookieSecure = secure })
 		c := e.registerAndLogin("alice", "correct horse")
-		got := e.do("POST", "/api/auth/logout", "", nil, c).sessionCookie()
-		if got == nil {
-			t.Fatal("no clearing cookie")
-		}
-		if got.Name != sessionCookieName || got.Path != "/" || !got.HttpOnly ||
-			got.SameSite != http.SameSiteLaxMode || got.Secure != secure || got.MaxAge >= 0 {
-			t.Errorf("secure=%v: clearing cookie = %+v", secure, got)
+		out := e.do("POST", "/api/auth/logout", "", nil, c)
+		for name, path := range map[string]string{sessionCookieName: "/api", wsCookieName: "/ws"} {
+			got := out.cookie(name)
+			if got == nil {
+				t.Fatalf("no clearing cookie for %s", name)
+			}
+			if got.Path != path || !got.HttpOnly || got.SameSite != http.SameSiteLaxMode || got.Secure != secure || got.MaxAge >= 0 {
+				t.Errorf("secure=%v: clearing %s = %+v", secure, name, got)
+			}
 		}
 	}
 }
@@ -692,11 +739,78 @@ func TestWriteJSONEncodingFailureIsA500NotAnEmptySuccess(t *testing.T) {
 }
 
 func TestNewHTTPServerLimits(t *testing.T) {
-	srv := NewHTTPServer(":0", http.NotFoundHandler())
+	srv := NewHTTPServer(":0", http.NotFoundHandler(), time.Minute)
 	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {
 		t.Errorf("a server timeout is unset (slowloris protection): %+v", srv)
 	}
 	if srv.MaxHeaderBytes <= 0 || srv.MaxHeaderBytes > 64<<10 {
 		t.Errorf("MaxHeaderBytes = %d, want a small explicit cap", srv.MaxHeaderBytes)
+	}
+}
+
+// The point of the two cookies: Traefik forwards the browser's Cookie header to
+// the workspace container, where code running as the user can read it. A real
+// cookie jar decides what a browser would send to each path.
+func TestBrowserNeverSendsTheAPITokenToAWorkspace(t *testing.T) {
+	e := newEnv(t)
+	e.register("alice", "correct horse")
+	login := e.do("POST", "/api/auth/login", creds("alice", "correct horse"), nil)
+	if login.Code != 200 {
+		t.Fatalf("login: %d", login.Code)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &url.URL{Scheme: "http", Host: "berth.test", Path: "/api/auth/login"}
+	jar.SetCookies(base, login.Result().Cookies())
+
+	names := func(path string) map[string]bool {
+		out := map[string]bool{}
+		for _, c := range jar.Cookies(&url.URL{Scheme: "http", Host: "berth.test", Path: path}) {
+			out[c.Name] = true
+		}
+		return out
+	}
+	for _, path := range []string{"/ws/alice/terminal", "/ws/alice/terminal/ws", "/ws/alice/browser/", "/ws/bob/terminal"} {
+		got := names(path)
+		if got[sessionCookieName] {
+			t.Errorf("%s: the browser would send the API token into the workspace", path)
+		}
+		if !got[wsCookieName] {
+			t.Errorf("%s: the browser would not send the workspace token, so ForwardAuth could never pass", path)
+		}
+	}
+	for _, path := range []string{"/api/me", "/api/auth/logout", "/api/workspace/start"} {
+		got := names(path)
+		if !got[sessionCookieName] {
+			t.Errorf("%s: the browser would not send the API token", path)
+		}
+		if got[wsCookieName] {
+			t.Errorf("%s: the workspace token should not travel to the API", path)
+		}
+	}
+	for _, path := range []string{"/", "/index.html", "/assets/app.js", "/apix", "/wsx/alice"} {
+		if got := names(path); len(got) != 0 {
+			t.Errorf("%s: cookies leaked to an unrelated path: %v", path, got)
+		}
+	}
+}
+
+// Neither token is a substitute for the other, so a workspace that steals the
+// workspace token can reach workspaces (it is the user's own) but never the API.
+func TestWorkspaceTokenDoesNotAuthenticateTheAPI(t *testing.T) {
+	e := newEnv(t)
+	api, ws := e.registerAndLoginBoth("alice", "correct horse")
+
+	asAPI := &http.Cookie{Name: sessionCookieName, Value: ws.Value}
+	if code := e.do("GET", "/api/me", "", nil, asAPI).Code; code != 401 {
+		t.Errorf("workspace token accepted by /api/me: %d", code)
+	}
+	if code := e.do("POST", "/api/auth/logout", "", nil, asAPI).Code; code != 204 {
+		t.Errorf("logout status %d", code) // always 204; but it must not have revoked anything:
+	}
+	if code := e.do("GET", "/api/me", "", nil, api).Code; code != 200 {
+		t.Errorf("a logout attempt with the workspace token revoked the real session: %d", code)
 	}
 }

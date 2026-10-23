@@ -168,16 +168,17 @@ func (s *SQLite) UserByID(ctx context.Context, id int64) (User, error) {
 }
 
 const workspaceSelect = `SELECT user_id, container_id, state, volume_name, mem_limit_mb, cpu_limit,
-	last_active_at, last_stopped_at, updated_at FROM workspaces`
+	last_active_at, last_stopped_at, updated_at, udp_port_start, udp_port_end, neko_password FROM workspaces`
 
 func scanWorkspace(r rowScanner) (Workspace, error) {
 	var (
 		w                       Workspace
-		containerID             sql.NullString
+		containerID, nekoPW     sql.NullString
 		lastActive, lastStopped sql.NullTime
+		udpStart, udpEnd        sql.NullInt64
 	)
 	err := r.Scan(&w.UserID, &containerID, &w.State, &w.VolumeName, &w.MemLimitMB, &w.CPULimit,
-		&lastActive, &lastStopped, &w.UpdatedAt)
+		&lastActive, &lastStopped, &w.UpdatedAt, &udpStart, &udpEnd, &nekoPW)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Workspace{}, ErrNotFound
@@ -185,6 +186,8 @@ func scanWorkspace(r rowScanner) (Workspace, error) {
 		return Workspace{}, fmt.Errorf("store: scan workspace: %w", err)
 	}
 	w.ContainerID = containerID.String
+	w.NekoPassword = nekoPW.String
+	w.UDPPortStart, w.UDPPortEnd = int(udpStart.Int64), int(udpEnd.Int64) // NULL scans as 0
 	w.LastActiveAt = nullTime(lastActive)
 	w.LastStoppedAt = nullTime(lastStopped)
 	w.UpdatedAt = w.UpdatedAt.UTC()
@@ -196,9 +199,13 @@ func (s *SQLite) WorkspaceByUserID(ctx context.Context, userID int64) (Workspace
 }
 
 func (s *SQLite) CreateSession(ctx context.Context, sess Session) error {
+	var wsHash any // NULL, not "", so the partial unique index ignores it
+	if sess.WSTokenHash != "" {
+		wsHash = sess.WSTokenHash
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-		sess.TokenHash, sess.UserID, fmtTime(sess.CreatedAt), fmtTime(sess.ExpiresAt))
+		`INSERT INTO sessions (token_hash, ws_token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		sess.TokenHash, wsHash, sess.UserID, fmtTime(sess.CreatedAt), fmtTime(sess.ExpiresAt))
 	if err != nil {
 		return fmt.Errorf("store: create session: %w", err)
 	}
@@ -211,6 +218,14 @@ func (s *SQLite) SessionUser(ctx context.Context, tokenHash string, now time.Tim
 		   FROM sessions s JOIN users u ON u.id = s.user_id
 		  WHERE s.token_hash = ? AND s.expires_at > ?`,
 		tokenHash, fmtTime(now)))
+}
+
+func (s *SQLite) WorkspaceSessionUser(ctx context.Context, wsTokenHash string, now time.Time) (User, error) {
+	return scanUser(s.db.QueryRowContext(ctx,
+		`SELECT u.id, u.username, u.password_hash, u.is_admin, u.created_at
+		   FROM sessions s JOIN users u ON u.id = s.user_id
+		  WHERE s.ws_token_hash = ? AND s.expires_at > ?`,
+		wsTokenHash, fmtTime(now)))
 }
 
 func (s *SQLite) DeleteSession(ctx context.Context, tokenHash string) error {

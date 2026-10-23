@@ -25,6 +25,18 @@ func TestDefaults(t *testing.T) {
 		BcryptCost:        12,
 		DefaultMemLimitMB: 2048,
 		DefaultCPULimit:   2.0,
+
+		WorkspaceImage:       "berth/workspace:latest",
+		TraefikContainer:     "berth-traefik",
+		TraefikEntrypoint:    "web",
+		UDPPortMin:           30000,
+		UDPPortMax:           30999,
+		UDPPortsPerWorkspace: 8,
+		Resolution:           "1280x720@30",
+		ShmSizeMB:            2048,
+		PidsLimit:            2048,
+		StopTimeout:          15 * time.Second,
+		StartTimeout:         45 * time.Second,
 	}
 	if cfg != want {
 		t.Fatalf("defaults:\n got %+v\nwant %+v", cfg, want)
@@ -124,5 +136,91 @@ func TestBoundaryValuesAreAccepted(t *testing.T) {
 	}
 	if cfg, err := Load(env(map[string]string{"BERTH_BCRYPT_COST": "10", "BERTH_DEFAULT_MEM_MB": "1", "BERTH_DEFAULT_CPUS": "0.01"})); err != nil || cfg.BcryptCost != 10 {
 		t.Fatalf("lower bounds rejected: %+v, %v", cfg, err)
+	}
+}
+
+func TestWorkspaceOverrides(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		"BERTH_WORKSPACE_IMAGE":         "registry.example.com/team/ws:1.2.3",
+		"BERTH_TRAEFIK_CONTAINER":       "proxy_1",
+		"BERTH_TRAEFIK_ENTRYPOINT":      "websecure",
+		"BERTH_UDP_PORT_MIN":            "40000",
+		"BERTH_UDP_PORT_MAX":            "40063",
+		"BERTH_UDP_PORTS_PER_WORKSPACE": "16",
+		"BERTH_RESOLUTION":              "1920x1080@60",
+		"BERTH_PUBLIC_IP":               "203.0.113.7",
+		"BERTH_SHM_MB":                  "1024",
+		"BERTH_PIDS_LIMIT":              "4096",
+		"BERTH_STOP_TIMEOUT":            "30s",
+		"BERTH_START_TIMEOUT":           "2m",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkspaceImage != "registry.example.com/team/ws:1.2.3" || cfg.TraefikContainer != "proxy_1" ||
+		cfg.TraefikEntrypoint != "websecure" || cfg.UDPPortMin != 40000 || cfg.UDPPortMax != 40063 ||
+		cfg.UDPPortsPerWorkspace != 16 || cfg.Resolution != "1920x1080@60" || cfg.PublicIP != "203.0.113.7" ||
+		cfg.ShmSizeMB != 1024 || cfg.PidsLimit != 4096 || cfg.StopTimeout != 30*time.Second || cfg.StartTimeout != 2*time.Minute {
+		t.Fatalf("workspace overrides not applied: %+v", cfg)
+	}
+	if cfg, err := Load(env(map[string]string{"BERTH_PUBLIC_IP": "2001:db8::1"})); err != nil || cfg.PublicIP != "2001:db8::1" {
+		t.Fatalf("IPv6 public IP rejected: %v", err)
+	}
+}
+
+func TestProxyAttachmentCanBeDisabled(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"BERTH_TRAEFIK_CONTAINER": "none"}))
+	if err != nil || cfg.TraefikContainer != "" {
+		t.Fatalf("got %q, %v; want attachment disabled", cfg.TraefikContainer, err)
+	}
+}
+
+// Names, entrypoints and images are interpolated into Docker calls and Traefik
+// label keys, so metacharacters must be refused at startup.
+func TestWorkspaceValuesAreValidated(t *testing.T) {
+	bad := map[string]map[string]string{
+		"image with space":         {"BERTH_WORKSPACE_IMAGE": "a b"},
+		"image with backtick":      {"BERTH_WORKSPACE_IMAGE": "x`y"},
+		"image with comma":         {"BERTH_WORKSPACE_IMAGE": "a,b"},
+		"container with space":     {"BERTH_TRAEFIK_CONTAINER": "a b"},
+		"container with slash":     {"BERTH_TRAEFIK_CONTAINER": "../x"},
+		"container starting dash":  {"BERTH_TRAEFIK_CONTAINER": "-x"},
+		"entrypoint with comma":    {"BERTH_TRAEFIK_ENTRYPOINT": "web,admin"},
+		"entrypoint with backtick": {"BERTH_TRAEFIK_ENTRYPOINT": "we`b"},
+		"entrypoint with dot":      {"BERTH_TRAEFIK_ENTRYPOINT": "web.x"},
+		"resolution no fps":        {"BERTH_RESOLUTION": "1280x720"},
+		"resolution garbage":       {"BERTH_RESOLUTION": "big"},
+		"resolution zero fps":      {"BERTH_RESOLUTION": "1280x720@0"},
+		"resolution leading zero":  {"BERTH_RESOLUTION": "01280x720@30"},
+		"public ip not an ip":      {"BERTH_PUBLIC_IP": "example.com"},
+		"public ip with port":      {"BERTH_PUBLIC_IP": "1.2.3.4:80"},
+		"udp min below 1024":       {"BERTH_UDP_PORT_MIN": "80"},
+		"udp max above 65535":      {"BERTH_UDP_PORT_MAX": "70000"},
+		"udp range too small":      {"BERTH_UDP_PORT_MIN": "30000", "BERTH_UDP_PORT_MAX": "30003"},
+		"udp inverted":             {"BERTH_UDP_PORT_MIN": "31000", "BERTH_UDP_PORT_MAX": "30000"},
+		"zero ports per workspace": {"BERTH_UDP_PORTS_PER_WORKSPACE": "0"},
+		"shm too small":            {"BERTH_SHM_MB": "10"},
+		"pids too small":           {"BERTH_PIDS_LIMIT": "1"},
+		"pids absurd":              {"BERTH_PIDS_LIMIT": "99999999"},
+		"stop timeout too short":   {"BERTH_STOP_TIMEOUT": "100ms"},
+		"stop timeout too long":    {"BERTH_STOP_TIMEOUT": "1h"},
+		"start timeout too short":  {"BERTH_START_TIMEOUT": "1s"},
+		"start timeout not a time": {"BERTH_START_TIMEOUT": "soon"},
+	}
+	for name, e := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(env(e)); err == nil {
+				t.Fatalf("expected an error for %v", e)
+			}
+		})
+	}
+	// The limits themselves are accepted.
+	ok := map[string]string{
+		"BERTH_UDP_PORT_MIN": "1024", "BERTH_UDP_PORT_MAX": "65535", "BERTH_UDP_PORTS_PER_WORKSPACE": "64512",
+		"BERTH_SHM_MB": "64", "BERTH_PIDS_LIMIT": "64",
+		"BERTH_STOP_TIMEOUT": "1s", "BERTH_START_TIMEOUT": "5s",
+	}
+	if _, err := Load(env(ok)); err != nil {
+		t.Fatalf("boundary values rejected: %v", err)
 	}
 }

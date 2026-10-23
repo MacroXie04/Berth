@@ -10,7 +10,21 @@ import (
 	"github.com/MacroXie04/Berth/internal/workspace"
 )
 
-const sessionCookieName = "berth_session"
+// A login sets two independent cookies, each scoped to the paths that need it:
+//
+//	berth_session  Path=/api  the API credential (login state for /api/*)
+//	berth_ws       Path=/ws   proves identity to the ForwardAuth check only
+//
+// Traefik forwards the browser's Cookie header to the workspace container, where
+// code running as the user can read it. Scoping the tokens means the container
+// only ever sees berth_ws, which cannot call the API (and so cannot reach the
+// admin endpoints), while the API token never leaves /api.
+const (
+	sessionCookieName = "berth_session"
+	sessionCookiePath = "/api"
+	wsCookieName      = "berth_ws"
+	wsCookiePath      = "/ws"
+)
 
 // errBadLogin is the single message for every login failure, so the response
 // never says whether the username or the password was wrong.
@@ -97,13 +111,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	wsToken, wsTokenHash, err := auth.NewSessionToken()
+	if err != nil {
+		s.Log.Error("new workspace token", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	now := s.Now()
 	expires := now.Add(s.SessionTTL)
 	if err := s.Store.CreateSession(r.Context(), store.Session{
-		TokenHash: tokenHash,
-		UserID:    user.ID,
-		CreatedAt: now,
-		ExpiresAt: expires,
+		TokenHash:   tokenHash,
+		WSTokenHash: wsTokenHash,
+		UserID:      user.ID,
+		CreatedAt:   now,
+		ExpiresAt:   expires,
 	}); err != nil {
 		s.Log.Error("create session", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
@@ -113,7 +134,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("purge expired sessions", "err", err) // housekeeping only
 	}
 
-	s.setSessionCookie(w, token, expires)
+	s.setSessionCookies(w, token, wsToken, expires)
 	writeJSON(w, http.StatusOK, map[string]any{"user": newUserJSON(user)})
 }
 
@@ -125,7 +146,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.clearSessionCookie(w)
+	s.clearSessionCookies(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -144,30 +165,31 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// setSessionCookie issues the session cookie: HttpOnly so scripts cannot read
-// it, SameSite=Lax so other sites cannot make the browser send it on
+// sessionCookie builds one of the two session cookies: HttpOnly so scripts
+// cannot read it, SameSite=Lax so other sites cannot make the browser send it on
 // cross-site POSTs, Secure when the deployment terminates TLS.
-func (s *Server) setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    token,
-		Path:     "/",
+func (s *Server) sessionCookie(name, path, value string, expires time.Time, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     path,
 		Expires:  expires,
-		MaxAge:   int(expires.Sub(s.Now()).Seconds()),
+		MaxAge:   maxAge,
 		HttpOnly: true,
 		Secure:   s.CookieSecure,
 		SameSite: http.SameSiteLaxMode,
-	})
+	}
 }
 
-func (s *Server) clearSessionCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   s.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-	})
+func (s *Server) setSessionCookies(w http.ResponseWriter, apiToken, wsToken string, expires time.Time) {
+	maxAge := int(expires.Sub(s.Now()).Seconds())
+	http.SetCookie(w, s.sessionCookie(sessionCookieName, sessionCookiePath, apiToken, expires, maxAge))
+	http.SetCookie(w, s.sessionCookie(wsCookieName, wsCookiePath, wsToken, expires, maxAge))
+}
+
+// clearSessionCookies expires both cookies. A clearing cookie only replaces the
+// stored one if Name and Path match, so the paths must mirror setSessionCookies.
+func (s *Server) clearSessionCookies(w http.ResponseWriter) {
+	http.SetCookie(w, s.sessionCookie(sessionCookieName, sessionCookiePath, "", time.Time{}, -1))
+	http.SetCookie(w, s.sessionCookie(wsCookieName, wsCookiePath, "", time.Time{}, -1))
 }

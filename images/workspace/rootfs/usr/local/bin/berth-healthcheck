@@ -1,0 +1,17 @@
+#!/bin/sh
+# Container HEALTHCHECK: exit 0 only if BOTH services answer HTTP on loopback.
+#   ttyd  : GET /                      (no base path: Traefik strips /ws/<user>/terminal)
+#   neko  : GET <path prefix>/health   (NEKO_SERVER_PATH_PREFIX, "/" when unset)
+# Uses wget (present in the neko base image); no output on success.
+set -u
+
+ttyd_port=7681
+neko_port="${NEKO_SERVER_BIND:-:8080}"
+neko_port="${neko_port##*:}"
+prefix="${NEKO_SERVER_PATH_PREFIX:-}"
+prefix="${prefix%/}"
+
+probe() { wget -q -T 2 -t 1 -O /dev/null "$1"; }
+
+probe "http://127.0.0.1:${ttyd_port}/" || { echo "ttyd not answering on :${ttyd_port}" >&2; exit 1; }
+probe "http://127.0.0.1:${neko_port}${prefix}/health" || { echo "neko not answering on :${neko_port}${prefix}/health" >&2; exit 1; }

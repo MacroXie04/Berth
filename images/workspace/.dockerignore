@@ -1,0 +1,4 @@
+# keep the build context to what the Dockerfile COPYs
+README.md
+.dockerignore
+Dockerfile

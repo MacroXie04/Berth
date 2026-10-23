@@ -18,6 +18,9 @@ type Deps struct {
 	Hasher *auth.Hasher
 	Log    *slog.Logger
 	Now    func() time.Time // defaults to time.Now; injectable for tests
+	// Workspaces runs the container lifecycle. Nil means no container backend:
+	// the workspace endpoints answer 503 and everything else still works.
+	Workspaces WorkspaceService
 
 	SessionTTL        time.Duration
 	CookieSecure      bool
@@ -72,6 +75,13 @@ func (s *Server) Handler() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireUser)
 			r.Get("/me", s.handleMe)
+
+			r.Route("/workspace", func(r chi.Router) {
+				r.Get("/", s.handleWorkspaceStatus)
+				r.Post("/start", s.handleWorkspaceStart)
+				r.Post("/stop", s.handleWorkspaceStop)
+				r.Post("/heartbeat", s.handleWorkspaceHeartbeat)
+			})
 		})
 	})
 	return r
@@ -79,14 +89,15 @@ func (s *Server) Handler() http.Handler {
 
 // NewHTTPServer returns the production http.Server around h. The API proxies
 // and streams nothing, so every phase gets a short deadline, and request
-// headers are capped well below net/http's 1 MiB default.
-func NewHTTPServer(addr string, h http.Handler) *http.Server {
+// headers are capped well below net/http's 1 MiB default. writeTimeout must
+// outlast the slowest handler, which is a workspace start or stop.
+func NewHTTPServer(addr string, h http.Handler, writeTimeout time.Duration) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
 	}
