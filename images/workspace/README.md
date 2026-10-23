@@ -48,9 +48,13 @@ Flags this image was tested with (nothing else is needed): `--memory 2g --cpus 2
 * **ttyd `--check-origin`** rejects a WebSocket upgrade whose `Origin` host differs from `Host`, and also one with
   no `Origin` at all (non-browser clients must send `Origin` equal to `Host`). Traefik keeps `Host`, so browsers work.
 * **neko login without a second prompt**: the neko client (3.2.0) auto-logs in from `?usr=<name>&pwd=<password>` and
-  then removes both from the URL (read from the served bundle, not tested in a browser). Use the user password for a
-  normal user or the admin password if the owner should be neko admin (admin can change resolution and settings; the
-  user role cannot).
+  then removes both from the URL (verified in Chromium 141: `POST api/login` 200, the frame's `location.search` is
+  `?embed=1` afterwards). `embed=1` hides neko's own header, side panel and bars and keeps the video with its
+  Fullscreen and Picture-in-Picture buttons (`cast=1` also hides those two). Berth uses the member password
+  (`neko_password` from the API); the admin role can change resolution and settings, the member role cannot.
+  neko keeps its session token in the page origin's `localStorage` key `neko_session`: a stored token makes the next
+  load take over the previous session (a second tab kicks the first), so the Berth SPA clears it before creating the
+  frame and on logout.
 
 ### neko environment variables (v3 names)
 
@@ -73,10 +77,21 @@ Do **not** use the v2 names (`NEKO_EPR`, `NEKO_NAT1TO1`, `NEKO_PASSWORD`, `NEKO_
 documents that any v2 variable switches neko to a legacy compatibility mode (not verified here). The v3 name wins
 when both are set. Note that the project spec's `NEKO_EPR` is a v2 name: use `NEKO_WEBRTC_EPR`.
 
-The WebRTC media path itself (a real browser connecting over the published UDP range) was **not** tested; only that
-neko accepts and logs the settings (`webrtc starting epr=... nat1to1=...`). By default neko uses
-`stun:stun.l.google.com:19302` (an empty `NEKO_WEBRTC_ICESERVERS_*` falls back to it); set both
-`NEKO_WEBRTC_ICESERVERS_FRONTEND`/`_BACKEND` to a non-empty JSON list to use your own (untested).
+The WebRTC media path was tested with headless Chromium 141 (VP8 1280x720 playing in the SPA's iframe, input and
+clipboard working): on the Docker host the connection works whatever `NEKO_WEBRTC_NAT1TO1` says, because the host can
+route to the workspace's bridge address; from a client that cannot (Chromium in another network namespace) it connects
+only with `NEKO_WEBRTC_NAT1TO1` set to a reachable address, through the published UDP port (iptables DNAT counter
+confirmed), and never connects without it. That is why `BERTH_PUBLIC_IP` is required for every remote browser. The
+browser only offers an mDNS host candidate, which neko cannot resolve; the connection works through a peer-reflexive
+pair. Not tested: a real NAT or cloud firewall, IPv6, `userland-proxy=false` at scale, TURN, audio.
+
+`NEKO_WEBRTC_UDPMUX=<port>` (Berth's default, one port) serves every viewer from a single UDP socket; `NEKO_WEBRTC_EPR=a-b`
+gives each viewer a port of the range. EPR leaked sockets in tests (2 of 6 reloads that reused a stored session left
+their port bound; after enough of them the 8-port block was full and no new viewer could connect until neko was
+restarted) and a closed tab holds its port for 5-10 s; UDPMUX had neither problem (10 of 10 reloads, 3 concurrent
+viewers). With an empty `NEKO_WEBRTC_NAT1TO1` neko calls `https://checkip.amazonaws.com` at every start. By default
+the browser also contacts `stun:stun.l.google.com:19302` (an empty `NEKO_WEBRTC_ICESERVERS_*` falls back to it); set
+both `NEKO_WEBRTC_ICESERVERS_FRONTEND`/`_BACKEND` to a non-empty JSON list to use your own (untested).
 
 ## Chromium profile (persistence)
 

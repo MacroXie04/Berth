@@ -4,7 +4,7 @@ A single-host, multi-user "Linux workstation in the browser". One machine runs o
 
 The whole system is one Go backend + [Traefik](https://traefik.io/) + Docker. See [CLAUDE.md](CLAUDE.md) for the design.
 
-> **Status: Milestone 2 (container management).** Accounts, sessions, the ForwardAuth check and the workspace lifecycle (power on / off, status, heartbeat) work, and `/ws/<username>/terminal` serves a real terminal. The frontend, the reaper and the admin page arrive in later milestones.
+> **Status: Milestone 3 (browser and frontend).** Log in at `http://<host>/`, power the workspace on, and use a terminal and a remote Chromium side by side in the browser. Accounts, sessions, the ForwardAuth check and the workspace lifecycle work. The idle reaper and the admin page arrive in later milestones.
 
 ## Quick start (backend only)
 
@@ -34,7 +34,9 @@ echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)" >> .env   # required
 docker compose up -d --build        # builds the backend and the workspace image (large first build)
 ```
 
-Then, through Traefik on port 80:
+Then open `http://localhost/` (or `http://<host>/`): register, log in, press **Power on**, and the terminal and the remote browser appear side by side once the workspace is up (a cold start takes about 15 s). The divider between them can be dragged or moved with the arrow keys.
+
+The same thing from the command line, through Traefik on port 80:
 
 ```sh
 curl -s -c jar localhost/api/auth/login -H 'Content-Type: application/json' -d '{"username":"alice","password":"correct horse"}'
@@ -56,7 +58,7 @@ curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspa
   { "default-address-pools": [{ "base": "10.200.0.0/16", "size": 28 }] }
   ```
 
-- **UDP ports.** Each workspace publishes `BERTH_UDP_PORTS_PER_WORKSPACE` UDP ports (default 8) for the browser's WebRTC video, from `BERTH_UDP_PORT_MIN`-`MAX` (default 30000-30999, so 125 workspaces). Open that range in the firewall, and set `BERTH_PUBLIC_IP` when the host is behind NAT or in a cloud VM. Every published port costs a `docker-proxy` process; beyond a few dozen users set `"userland-proxy": false` in `daemon.json`.
+- **UDP ports and `BERTH_PUBLIC_IP`.** The remote browser's video is WebRTC. Each workspace publishes `BERTH_UDP_PORTS_PER_WORKSPACE` UDP ports (default 1: neko multiplexes every viewer of the workspace over one port; a larger block gives each viewer its own port, but closed tabs were seen to keep their port for 5-10 s and some stayed bound until neko restarted) from `BERTH_UDP_PORT_MIN`-`MAX` (default 30000-30999, so up to 1000 workspaces). Open that range in the firewall. **Set `BERTH_PUBLIC_IP` to the address browsers use to reach this host** (its LAN address on a LAN, its public address on the internet): it is required for every browser that is not on the Docker host itself, because without it neko offers only the workspace's private bridge address and the video never connects (the backend logs a warning at startup when it is empty). Every published port costs a `docker-proxy` process; beyond a few dozen users set `"userland-proxy": false` in `daemon.json`.
 - **The Docker socket.** The backend mounts `/var/run/docker.sock` to create containers, which is root-equivalent on the host. It runs unprivileged and joins the socket's group (`DOCKER_GID`).
 
 ## How access is controlled
@@ -81,6 +83,17 @@ set -a; . ./.env; set +a; go run ./cmd/berth
 ```
 
 ## Development
+
+The web app lives in `web/` (React, Vite, TypeScript, xterm.js; see [web/README.md](web/README.md)). The Go binary embeds the build from `internal/webui/dist` (git-ignored except `.gitkeep`), which the Docker build produces in a Node stage:
+
+```sh
+cd web && npm ci && npm run build      # writes ../internal/webui/dist
+cd .. && go run ./cmd/berth            # serves the app at / and the API at /api
+cd web && npm run dev                  # or: Vite dev server with /api and /ws proxied to a running stack on :18090
+cd web && npm test                     # unit tests; npm run e2e / node e2e/lifecycle.mjs drive a real Chromium against a stack
+```
+
+Without a build `GET /` answers `503 frontend not built` while the API keeps working.
 
 ```sh
 go vet ./... && go test ./...                          # unit tests, no Docker needed

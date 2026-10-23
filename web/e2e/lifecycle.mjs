@@ -74,7 +74,9 @@ async function newPage(ctx) {
   page.on('console', (m) => {
     const t = m.text()
     if (t.startsWith('CSPVIOLATION')) problems.csp.push(`[${step.slice(0, 40)}] ${t}`)
-    else if (m.type() === 'error' && !/Failed to load resource|WebSocket connection to .* failed/.test(t)) {
+    // The clipboard-read refusal is intended: the app's Permissions-Policy denies it so that neko cannot copy the
+    // user's local clipboard into the workspace; neko's client tries on every mouse-enter and Chromium logs it.
+    else if (m.type() === 'error' && !/Failed to load resource|WebSocket connection to .* failed|Permissions policy violation: The Clipboard API/.test(t)) {
       problems.consoleErrors.push(`[${step.slice(0, 40)}] ${t.slice(0, 200)}`)
     }
   })
@@ -220,24 +222,28 @@ try {
       return `udp/${port}`
     })
 
-    await run('browser: a click and typing in the video reach the remote Chromium', async () => {
+    await run('browser: a click and typing in the video reach the remote Chromium (the search shows up in its history)', async () => {
       const f = nekoFrame(page)
       const box = await f.locator('video').boundingBox()
       if (!box) throw new Error('no video box')
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2) // implicit hosting: first click takes control
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2) // implicit hosting: the first click takes control
       await sleep(500)
-      await page.keyboard.press('Control+L')
-      await sleep(300)
-      await page.keyboard.type('m3typed.invalid') // unshifted characters only: synthetic shifted keys are unreliable against neko
-      await page.keyboard.press('Enter')
-      const title = await waitFor(
+      // Unshifted characters only: synthetic shifted keys are unreliable against neko's keyboard handler.
+      const token = `m3typed${Date.now() % 100000}`
+      await page.keyboard.press('Control+L') // focus the remote omnibox
+      await sleep(400)
+      await page.keyboard.type(token)
+      await page.keyboard.press('Enter') // the omnibox turns it into a search; the visit lands in Chromium's history
+      const py = "import sqlite3,shutil,sys;shutil.copy('/home/user/.config/chromium/Default/History','/tmp/e2e-history.db');" +
+        "c=sqlite3.connect('/tmp/e2e-history.db');print('\\n'.join(r[0] for r in c.execute('select url from urls where url like ?',('%'+sys.argv[1]+'%',))))"
+      const url = await waitFor(
         () => {
-          const names = dockerTry('exec', CONTAINER, 'sh', '-c', 'DISPLAY=:99.0 xdotool search --onlyvisible --class chromium getwindowname %@ 2>/dev/null')
-          return names && /m3typed/.test(names) ? names.trim().split('\n').filter((l) => /m3typed/.test(l))[0] : null
+          const out = dockerTry('exec', CONTAINER, 'python3', '-c', py, token)
+          return out && out.trim() ? out.trim().split('\n')[0] : null
         },
-        { timeout: 20000, interval: 500, what: 'the remote Chromium window to show the typed host name' },
+        { timeout: 30000, interval: 1000, what: `${token} to appear in the remote Chromium's history` },
       )
-      return title
+      return `visited ${url.replace(token, '<token>')}`
     })
     await shot(page, 'lifecycle-3-typed')
   }
