@@ -44,6 +44,12 @@ type Config struct {
 	// networks; it bounds how long workspaces are unreachable after Traefik is
 	// recreated.
 	ProxyAttachInterval time.Duration // BERTH_PROXY_ATTACH_INTERVAL
+
+	// The reaper (internal/reaper).
+	IdleTimeout    time.Duration // BERTH_IDLE_TIMEOUT: a running workspace unused this long is stopped
+	ReclaimAfter   time.Duration // BERTH_RECLAIM_AFTER: a workspace stopped this long loses its container
+	ReaperInterval time.Duration // BERTH_REAPER_INTERVAL: how often the reaper looks
+	IdleCPUPercent float64       // BERTH_IDLE_CPU_PERCENT: average CPU at or above this counts as use (100 = one core); 0 ignores CPU
 }
 
 // noProxy is the BERTH_TRAEFIK_CONTAINER value that turns proxy attachment off.
@@ -71,6 +77,14 @@ const (
 const (
 	MaxMemLimitMB = 1 << 20 // 1 TiB
 	MaxCPULimit   = 1024
+)
+
+// Bounds for the reaper's settings. The age limit exists to reject typos (and
+// keep a duration comfortably inside what the database and time arithmetic hold),
+// not to size a deployment.
+const (
+	MaxReaperAge      = 3650 * 24 * time.Hour
+	MaxIdleCPUPercent = 1000
 )
 
 // Load reads the configuration through getenv (os.Getenv in production) and
@@ -101,6 +115,11 @@ func Load(getenv func(string) string) (Config, error) {
 		StopTimeout:          l.duration("BERTH_STOP_TIMEOUT", 15*time.Second),
 		StartTimeout:         l.duration("BERTH_START_TIMEOUT", 45*time.Second),
 		ProxyAttachInterval:  l.duration("BERTH_PROXY_ATTACH_INTERVAL", 10*time.Second),
+
+		IdleTimeout:    l.duration("BERTH_IDLE_TIMEOUT", 30*time.Minute),
+		ReclaimAfter:   l.duration("BERTH_RECLAIM_AFTER", 7*24*time.Hour),
+		ReaperInterval: l.duration("BERTH_REAPER_INTERVAL", time.Minute),
+		IdleCPUPercent: l.float("BERTH_IDLE_CPU_PERCENT", 5),
 	}
 	if cfg.TraefikContainer == noProxy {
 		cfg.TraefikContainer = ""
@@ -159,6 +178,20 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if cfg.ProxyAttachInterval < 2*time.Second || cfg.ProxyAttachInterval > 10*time.Minute {
 		l.fail("BERTH_PROXY_ATTACH_INTERVAL must be between 2s and 10m")
+	}
+
+	if cfg.IdleTimeout < time.Minute || cfg.IdleTimeout > MaxReaperAge {
+		l.fail("BERTH_IDLE_TIMEOUT must be between 1m and %s", MaxReaperAge)
+	}
+	if cfg.ReclaimAfter < time.Minute || cfg.ReclaimAfter > MaxReaperAge {
+		l.fail("BERTH_RECLAIM_AFTER must be between 1m and %s", MaxReaperAge)
+	}
+	if cfg.ReaperInterval < 5*time.Second || cfg.ReaperInterval > time.Hour {
+		l.fail("BERTH_REAPER_INTERVAL must be between 5s and 1h")
+	}
+	// !(x >= 0) also rejects NaN.
+	if !(cfg.IdleCPUPercent >= 0) || cfg.IdleCPUPercent > MaxIdleCPUPercent {
+		l.fail("BERTH_IDLE_CPU_PERCENT must be a number between 0 and %d", MaxIdleCPUPercent)
 	}
 
 	if err := errors.Join(l.errs...); err != nil {

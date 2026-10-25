@@ -219,6 +219,39 @@ func TestMobyContainerLifecycle(t *testing.T) {
 		t.Errorf("implausible stats: %+v", st)
 	}
 
+	// CPUUsage is one cumulative reading that does not wait for a second sample,
+	// stamped with the daemon's clock; two readings never go backwards.
+	began := time.Now()
+	u1, err := m.CPUUsage(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 800*time.Millisecond {
+		t.Errorf("CPUUsage took %v: it must not wait for a previous sample", took)
+	}
+	time.Sleep(50 * time.Millisecond)
+	u2, err := m.CPUUsage(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u1.At.IsZero() || !u2.At.After(u1.At) || u2.TotalNanos < u1.TotalNanos {
+		t.Errorf("CPUUsage readings %+v then %+v", u1, u2)
+	}
+	// ManagedContainers finds Berth's container by label, running or not.
+	listed, err := m.ManagedContainers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *ContainerInfo
+	for i := range listed {
+		if listed[i].ID == id {
+			found = &listed[i]
+		}
+	}
+	if found == nil || found.Name != name || !found.Running || found.Status != "running" || found.Labels[LabelUser] != "tester" {
+		t.Errorf("ManagedContainers = %+v, want the running container %s", listed, name)
+	}
+
 	// Stop (twice) is graceful and idempotent.
 	if err := m.StopContainer(ctx, id, 5*time.Second); err != nil {
 		t.Fatal(err)
@@ -228,6 +261,18 @@ func TestMobyContainerLifecycle(t *testing.T) {
 	}
 	if info, _ = m.InspectContainer(ctx, id); info.Running || info.Status != "exited" || info.FinishedAt.IsZero() {
 		t.Errorf("stopped container info: %+v", info)
+	}
+	if listed, err = m.ManagedContainers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	found = nil
+	for i := range listed {
+		if listed[i].ID == id {
+			found = &listed[i]
+		}
+	}
+	if found == nil || found.Running || found.Status != "exited" {
+		t.Errorf("a stopped container must still be listed: %+v", found)
 	}
 	// ... and a stopped container can be started again (the "returning user" path).
 	if err := m.StartContainer(ctx, id); err != nil {

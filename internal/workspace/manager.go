@@ -74,6 +74,7 @@ const (
 	opStart   = "start"
 	opStop    = "stop"
 	opRecover = "recover"
+	opReclaim = "reclaim"
 )
 
 // flights records which operation, if any, currently owns each user's workspace
@@ -460,49 +461,59 @@ func (m *Manager) Stop(ctx context.Context, user store.User) (Status, error) {
 		return Status{}, err
 	}
 	if other, ok := m.flight.begin(user.ID, opStop); !ok {
-		if other == opStop {
+		// Another power-off, or the reaper removing the container of a stopped
+		// workspace: either leaves the workspace powered off, so report. Only a
+		// start in progress is a conflict.
+		if other == opStop || other == opReclaim {
 			return m.Status(ctx, user)
 		}
 		return Status{}, ErrBusy
 	}
-	if err := m.stopClaimed(ctx, user); err != nil {
+	if _, err := m.stopClaimed(ctx, user, nil); err != nil {
 		return Status{}, err
 	}
 	return m.Status(ctx, user)
 }
 
 // stopClaimed does a stop with the workspace claimed and releases the claim when
-// it returns, however it returns.
-func (m *Manager) stopClaimed(ctx context.Context, user store.User) error {
+// it returns, however it returns. A non-nil guard is asked about the workspace as
+// it is read under the claim, and the stop happens only if the workspace is
+// running (or starting: a container that never turns healthy must be reapable
+// too) and the guard agrees; stopped reports whether a stop was carried out
+// (or the container turned out to be gone).
+func (m *Manager) stopClaimed(ctx context.Context, user store.User, guard func(store.Workspace) bool) (stopped bool, err error) {
 	defer m.flight.end(user.ID)
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.StopTimeout+30*time.Second)
 	defer cancel()
 
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if guard != nil && ((ws.State != store.StateRunning && ws.State != store.StateStarting) || !guard(ws)) {
+		return false, nil
 	}
 	if _, err := Next(ws.State, EventStop); err != nil {
-		return nil // offline or already stopped
+		return false, nil // offline or already stopped
 	}
 	if ws.ContainerID == "" {
 		// `starting` with no container while no start is running: abandoned.
-		return m.recoverClaimed(ctx, user)
+		return false, m.recoverClaimed(ctx, user)
 	}
 
 	event, opts := EventStop, []store.TransitionOption{store.SetStoppedAt(m.now())}
 	if err := m.docker.StopContainer(ctx, ws.ContainerID, m.cfg.StopTimeout); err != nil {
 		if !errors.Is(err, docker.ErrNotFound) {
-			return err
+			return false, err
 		}
 		event, opts = EventGone, []store.TransitionOption{store.ClearContainer(), store.ReleaseUDPRange()}
 	}
 	to, _ := Next(ws.State, event)
 	if _, err := m.store.TransitionWorkspace(ctx, user.ID, Sources(event), to, m.now(), opts...); err != nil &&
 		!errors.Is(err, store.ErrStateConflict) {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // Status brings the database in line with what Docker reports about the
@@ -515,6 +526,17 @@ func (m *Manager) stopClaimed(ctx context.Context, user store.User) error {
 // is merely not running yet is not a crash, and an answer from before the
 // operation says nothing about the container it left behind.
 func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
+	return m.status(ctx, user, true)
+}
+
+// Reconcile is Status without the resource sample: it brings the database in line
+// with Docker and reports the result. The reaper uses it for every workspace on
+// every pass, where a ~1 s `docker stats` per running container would add up.
+func (m *Manager) Reconcile(ctx context.Context, user store.User) (Status, error) {
+	return m.status(ctx, user, false)
+}
+
+func (m *Manager) status(ctx context.Context, user store.User, withStats bool) (Status, error) {
 	epoch := m.flight.mark(user.ID)
 	ws, err := m.store.WorkspaceByUserID(ctx, user.ID)
 	if err != nil {
@@ -571,6 +593,12 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 			}
 			opts = append(opts, store.SetStoppedAt(stopped))
 		}
+		if ev == EventResumed {
+			// Started behind Berth's back: its last activity is from a session that
+			// ended long ago. The idle clock starts when Berth first notices it, or
+			// the reaper would stop it again within a pass.
+			opts = append(opts, store.SetActiveAt(m.now()))
+		}
 		updated, terr := m.store.TransitionWorkspace(ctx, user.ID, []store.State{ws.State}, to, m.now(), opts...)
 		switch {
 		case terr == nil:
@@ -585,7 +613,7 @@ func (m *Manager) Status(ctx context.Context, user store.User) (Status, error) {
 		}
 	}
 
-	if st.Workspace.State == store.StateRunning && info.Running {
+	if withStats && st.Workspace.State == store.StateRunning && info.Running {
 		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if stats, serr := m.docker.ContainerStats(sctx, ws.ContainerID); serr == nil {
@@ -602,21 +630,35 @@ func (m *Manager) Heartbeat(ctx context.Context, user store.User) error {
 	return m.store.TouchLastActive(ctx, user.ID, m.now())
 }
 
-// ReattachTraefik connects the proxy to every user network. Docker drops the
-// attachment when the Traefik container is recreated (for example by
-// `docker compose up -d` after an image update), after which every workspace
-// would answer 504 until something reconnected it. It is idempotent and cheap,
-// so the backend runs it at startup and periodically.
+// ReattachTraefik connects the proxy to the network of every workspace that is
+// starting or running. Docker drops the attachment when the Traefik container is
+// recreated (for example by `docker compose up -d` after an image update), after
+// which every such workspace would answer 504 until something reconnected it. It
+// is idempotent, so the backend runs it at startup and every few seconds.
+//
+// Only workspaces that are up need it: a stopped or offline user's network is
+// attached by their next power-on, before the container starts. Looping over every
+// network that ever existed would cost the daemon three calls per network every
+// interval, for ever, and push the recovery time of a Traefik redeploy past the
+// interval once there are hundreds of them.
 func (m *Manager) ReattachTraefik(ctx context.Context) error {
 	if m.cfg.TraefikContainer == "" {
 		return nil
 	}
-	nets, err := m.docker.ManagedNetworks(ctx)
+	rows, err := m.store.ListWorkspaces(ctx)
 	if err != nil {
 		return err
 	}
 	var errs []error
-	for _, n := range nets {
+	for _, uw := range rows {
+		if st := uw.Workspace.State; st != store.StateStarting && st != store.StateRunning {
+			continue
+		}
+		if err := checkName(uw.User.Username); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		n := NetworkName(uw.User.Username)
 		if err := m.docker.ConnectToNetwork(ctx, n, m.cfg.TraefikContainer); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", n, err))
 		}

@@ -243,3 +243,87 @@ func TestGatewayPrioritySupportFollowsTheNegotiatedVersion(t *testing.T) {
 		})
 	}
 }
+
+// CPUUsage takes one reading without the daemon's second-long wait for a previous
+// sample, and reports the daemon's own timestamp.
+func TestCPUUsageIsASingleSampleWithTheDaemonsClock(t *testing.T) {
+	d, m := newStubDaemon(t)
+	var query string
+	d.handlers["GET /containers/c1/stats"] = func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		io.WriteString(w, `{"read":"2026-01-02T03:04:05.5Z","cpu_stats":{"cpu_usage":{"total_usage":123456789},"online_cpus":2}}`)
+	}
+	d.handlers["GET /containers/none/stats"] = reply(404, `{"message":"No such container: none"}`)
+
+	got, err := m.CPUUsage(stubCtx(t), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalNanos != 123456789 || !got.At.Equal(time.Date(2026, 1, 2, 3, 4, 5, 500_000_000, time.UTC)) {
+		t.Fatalf("CPUUsage = %+v", got)
+	}
+	if !strings.Contains(query, "one-shot=true") || !strings.Contains(query, "stream=false") {
+		t.Fatalf("query %q: want a one-shot, non-streaming request (a previous sample costs the daemon a second)", query)
+	}
+	if _, err := m.CPUUsage(stubCtx(t), "none"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing container: %v", err)
+	}
+}
+
+// ManagedContainers asks the daemon for Berth's own containers only, running or not.
+func TestManagedContainersFiltersByLabelAndIncludesStoppedOnes(t *testing.T) {
+	d, m := newStubDaemon(t)
+	var query string
+	d.handlers["GET /containers/json"] = func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		io.WriteString(w, `[
+			{"Id":"b","Names":["/berth-ws-bob"],"State":"exited","Labels":{"berth.managed":"true","berth.user":"bob"}},
+			{"Id":"a","Names":["/berth-ws-alice"],"State":"running","Labels":{"berth.managed":"true","berth.user":"alice"}}]`)
+	}
+	got, err := m.ManagedContainers(stubCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(query, "all=1") && !strings.Contains(query, "all=true") {
+		t.Errorf("query %q lacks all=: stopped containers would be missed", query)
+	}
+	if !strings.Contains(query, "berth.managed%3Dtrue") && !strings.Contains(query, "berth.managed=true") {
+		t.Errorf("query %q lacks the berth.managed label filter", query)
+	}
+	if len(got) != 2 || got[0].Name != "berth-ws-alice" || got[1].Name != "berth-ws-bob" {
+		t.Fatalf("containers = %+v, want alice then bob sorted by name without the leading slash", got)
+	}
+	if !got[0].Running || got[0].Status != "running" || got[0].Labels["berth.user"] != "alice" || got[0].ID != "a" {
+		t.Errorf("alice = %+v", got[0])
+	}
+	if got[1].Running || got[1].Status != "exited" {
+		t.Errorf("bob = %+v", got[1])
+	}
+}
+
+// Removing a workspace's container is a force-remove (a stuck container must go)
+// that never takes its volume: the user's files outlive their container.
+func TestRemoveContainerForcesButNeverRemovesVolumes(t *testing.T) {
+	d, m := newStubDaemon(t)
+	var query string
+	d.handlers["DELETE /containers/c1"] = func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		w.WriteHeader(204)
+	}
+	if err := m.RemoveContainer(stubCtx(t), "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(query, "force=1") && !strings.Contains(query, "force=true") {
+		t.Errorf("query %q: the removal must be forced", query)
+	}
+	for _, bad := range []string{"v=1", "v=true"} {
+		if strings.Contains(query, bad) {
+			t.Errorf("query %q asks the daemon to remove the container's volumes", query)
+		}
+	}
+	// A container that is already gone is not an error.
+	d.handlers["DELETE /containers/gone"] = reply(404, `{"message":"No such container: gone"}`)
+	if err := m.RemoveContainer(stubCtx(t), "gone"); err != nil {
+		t.Errorf("removing a missing container: %v", err)
+	}
+}

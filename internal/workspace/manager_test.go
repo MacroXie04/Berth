@@ -3,7 +3,6 @@ package workspace
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -738,13 +737,59 @@ func TestReattachTraefikKeepsGoingAfterOneFailure(t *testing.T) {
 
 func TestReattachTraefikDisabledAndErrors(t *testing.T) {
 	r := newRig(t, func(c *Config) { c.TraefikContainer = "" })
-	if err := r.m.ReattachTraefik(ctx); err != nil || r.dock.CallCount("ManagedNetworks") != 0 {
+	r.mustStart(r.user("alice"))
+	if err := r.m.ReattachTraefik(ctx); err != nil || r.dock.CallCount("ConnectToNetwork") != 0 {
 		t.Fatalf("disabled reattach did work: %v", err)
 	}
+	// A database that cannot be read is an error, not "nothing to do".
 	r2 := newRig(t)
-	r2.dock.FailNext("ManagedNetworks", fmt.Errorf("docker is down"))
+	r2.mustStart(r2.user("alice"))
+	r2.st.Close()
 	if err := r2.m.ReattachTraefik(ctx); err == nil {
-		t.Fatal("a Docker failure was swallowed")
+		t.Fatal("a database failure was swallowed")
+	}
+}
+
+// Only workspaces that are up need the proxy: a stopped or offline user's network
+// is attached by their next power-on, and looping over every network that ever
+// existed would cost the daemon a few calls per network every interval, for ever.
+func TestReattachTraefikOnlyTouchesWorkspacesThatAreUp(t *testing.T) {
+	r := newRig(t)
+	up, starting, stopped := r.user("running-user"), r.user("starting-user"), r.user("stopped-user")
+	offline := r.user("offline-user")
+	r.mustStart(up)
+	r.dock.SetHealth(r.containerID("running-user"), docker.HealthHealthy)
+	if st, _ := r.m.Status(ctx, up); st.Workspace.State != store.StateRunning {
+		t.Fatalf("setup: %+v", st.Workspace)
+	}
+	r.mustStart(starting)
+	r.mustStart(stopped)
+	if _, err := r.m.Stop(ctx, stopped); err != nil {
+		t.Fatal(err)
+	}
+	_ = offline
+
+	r.dock.Vanish(r.traefik) // Traefik is recreated: no attachments
+	r.dock.AddContainer(traefikName)
+	before := r.dock.CallCount("ConnectToNetwork")
+	if err := r.m.ReattachTraefik(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.dock.CallCount("ConnectToNetwork") - before; n != 2 {
+		t.Errorf("ConnectToNetwork called %d times, want 2 (the running and the starting workspace)", n)
+	}
+	for _, n := range []string{"berth-net-running-user", "berth-net-starting-user"} {
+		if !strings.Contains(strings.Join(r.dock.NetworkMembers(n), ","), traefikName) {
+			t.Errorf("Traefik not attached to %s", n)
+		}
+	}
+	if strings.Contains(strings.Join(r.dock.NetworkMembers("berth-net-stopped-user"), ","), traefikName) {
+		t.Error("Traefik was attached to a stopped workspace's network")
+	}
+	// A stopped workspace is attached by its own power-on.
+	r.mustStart(stopped)
+	if !strings.Contains(strings.Join(r.dock.NetworkMembers("berth-net-stopped-user"), ","), traefikName) {
+		t.Error("power-on did not attach Traefik to the returning user's network")
 	}
 }
 
@@ -787,5 +832,44 @@ func TestStatusSurfacesDockerErrors(t *testing.T) {
 	// Nothing was changed by the failed observation.
 	if r.ws(u).State != store.StateStarting {
 		t.Fatalf("state = %s", r.ws(u).State)
+	}
+}
+
+// The network name is built from the username in the database row. A row that
+// validation never saw (a restored or hand-edited database) must not reach the
+// Docker API; the others are still attached.
+func TestReattachTraefikRefusesAnInvalidUsernameInTheDatabase(t *testing.T) {
+	r := newRig(t)
+	good := r.user("alice")
+	r.mustStart(good)
+	r.dock.Vanish(r.traefik)
+	r.dock.AddContainer(traefikName)
+
+	bad, _, err := r.st.CreateUser(ctx, store.NewUser{
+		Username: "x/../../containers/abc", PasswordHash: "x", VolumeName: "berth-data-bad", MemLimitMB: 2048, CPULimit: 2,
+	}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.st.TransitionWorkspace(ctx, bad.ID, []store.State{store.StateOffline}, store.StateRunning, t0,
+		store.SetContainerID("c-bad")); err != nil {
+		t.Fatal(err)
+	}
+
+	before := r.dock.CallCount("ConnectToNetwork")
+	err = r.m.ReattachTraefik(ctx)
+	if !errors.Is(err, ErrBadUsername) {
+		t.Fatalf("ReattachTraefik = %v, want an ErrBadUsername", err)
+	}
+	if n := r.dock.CallCount("ConnectToNetwork") - before; n != 1 {
+		t.Errorf("ConnectToNetwork called %d times, want only the valid user's network", n)
+	}
+	for _, call := range r.dock.Calls() {
+		if strings.Contains(call, "..") || strings.Contains(call, "containers/abc") {
+			t.Errorf("the invalid name reached Docker: %q", call)
+		}
+	}
+	if !strings.Contains(strings.Join(r.dock.NetworkMembers("berth-net-alice"), ","), traefikName) {
+		t.Error("the valid user was not attached")
 	}
 }

@@ -63,6 +63,12 @@ type Workspace struct {
 	NekoPassword string
 }
 
+// UserWorkspace is a user together with their workspace.
+type UserWorkspace struct {
+	User      User
+	Workspace Workspace
+}
+
 // Session is a login session. TokenHash and WSTokenHash are the hex sha256 of
 // the two cookie tokens (API scope and workspace scope).
 type Session struct {
@@ -91,6 +97,9 @@ type Store interface {
 	UserByUsername(ctx context.Context, username string) (User, error)
 	UserByID(ctx context.Context, id int64) (User, error)
 	WorkspaceByUserID(ctx context.Context, userID int64) (Workspace, error)
+	// ListWorkspaces returns every user with their workspace, ordered by user ID.
+	// Secrets are left out: User.PasswordHash and Workspace.NekoPassword are empty.
+	ListWorkspaces(ctx context.Context) ([]UserWorkspace, error)
 
 	CreateSession(ctx context.Context, s Session) error
 	// SessionUser returns the user owning the session, or ErrNotFound when

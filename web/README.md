@@ -52,7 +52,8 @@ split.ts            split-view maths: clamping, pointer -> ratio, WAI-ARIA split
 workspaceView.ts    state -> UI mapping (view, badge, banners, buttons, call-to-action text), poll/heartbeat
                     timing, error texts
 useWorkspace.ts     the hook: status polling (2 s starting / 10 s running / none when off, every 5 s while a request
-                    has failed), heartbeat (30 s, visible tab, starting/running), Power on / Power off, stale-answer
+                    has failed; a hidden tab every 60 s), heartbeat (30 s, starting/running, visible or hidden tab),
+                    Power on / Power off, stale-answer
                     protection (an answer is dropped when an action overtook it or a newer request was issued),
                     account check (see below)
 validation.ts       username / password rules (mirror of internal/auth; the server stays the authority)
@@ -113,9 +114,14 @@ Behaviour worth knowing:
 - **Login form.** While a request is under way the inputs stay enabled but read-only (`aria-busy`); only the submit button
   is disabled. A disabled input cannot take focus, and the page moves it to the password field after a failed login and to
   the username field after "taken".
-- A failed status request is retried every 5 s whatever the state (offline and stopped included) until it works, and a fresh
+- A failed status request is retried every 5 s whatever the state (offline and stopped included; a hidden tab: every 60 s) until it works, and a fresh
   answer from Power on / Power off clears the "Not up to date" flag.
-- Hidden tabs neither poll nor send heartbeats; on becoming visible again the page refreshes and sends one at once.
+- A hidden tab keeps sending heartbeats (an open page holds open terminal and browser connections, and the server powers
+  a workspace off when nobody has used it for the idle timeout) and polls the status once a minute instead of every 2 or
+  10 s, so it still learns that its workspace was powered off or that another account logged in, and stops beating. On
+  becoming visible again the page refreshes at once. A closed tab, a sleeping laptop or a lost connection send nothing:
+  that is what lets the server tell an abandoned workspace from a used one. (Chrome may hold a hidden tab's timers to one
+  a minute, which is why the idle timeout should not be set below a few minutes.)
 
 ## CSP
 
@@ -201,3 +207,19 @@ first step (so the run starts from "offline", and the test asserts that `/api/wo
 sockets bound inside the container (exactly one for the multiplexed port, and the full set the same after a second tab came
 and went), checks that a click and a key chord made in the video reach the remote Chromium (`xdotool` in the container), and
 that the container is stopped after Power off. Without it only what the browser sees is checked.
+
+### `e2e/reaper.mjs`: what a tab does to the idle clock
+
+Needs a stack with a fast reaper and a short idle timeout, and `docker` on this host (it reads the container's state
+directly: the API reconciles by itself, which would hide what the reaper did):
+
+```sh
+# .env of the stack: BERTH_IDLE_TIMEOUT=1m  BERTH_RECLAIM_AFTER=10m  BERTH_REAPER_INTERVAL=10s
+BASE_URL=http://127.0.0.1:18090 E2E_USER=alice E2E_PASSWORD='correct horse' IDLE_SECONDS=60 node e2e/reaper.mjs
+```
+
+A visible tab keeps the workspace up for 2.5 idle timeouts; so does a hidden one (`visibilityState` faked: the only thing the
+page can see); with the tab closed the container is stopped after about one timeout and kept (`exited`); a tab that stays
+open but whose heartbeats are blocked is powered off by the reaper, notices at its next poll, drops the panes, shows the
+"powered off" text (programs ended, files kept) and Power on brings the workspace back. `IDLE_SECONDS` must equal the stack's
+`BERTH_IDLE_TIMEOUT`; `SCREENSHOT_DIR` writes screenshots.

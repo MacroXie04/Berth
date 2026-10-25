@@ -4,7 +4,7 @@ A single-host, multi-user "Linux workstation in the browser". One machine runs o
 
 The whole system is one Go backend + [Traefik](https://traefik.io/) + Docker. See [CLAUDE.md](CLAUDE.md) for the design.
 
-> **Status: Milestone 3 (browser and frontend).** Log in at `http://<host>/`, power the workspace on, and use a terminal and a remote Chromium side by side in the browser. Accounts, sessions, the ForwardAuth check and the workspace lifecycle work. The idle reaper and the admin page arrive in later milestones.
+> **Status: Milestone 4 (reclaim).** Log in at `http://<host>/`, power the workspace on, and use a terminal and a remote Chromium side by side in the browser. Accounts, sessions, the ForwardAuth check and the workspace lifecycle work, and the backend stops workspaces nobody uses and removes the containers of long-stopped ones (see "What happens to a workspace nobody uses"). The admin page arrives in the next milestone.
 
 ## Quick start (backend only)
 
@@ -54,6 +54,7 @@ curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspa
 `docker compose up -d --build` rebuilds the backend. Two things it does not do by itself:
 
 - Compose now mounts the whole `traefik/` directory and Traefik watches it (`--providers.file.directory`), so a later `git pull` that replaces `traefik/dynamic.yml` is picked up without a restart. The first upgrade to this layout changes Traefik's service spec, so `docker compose up -d` recreates it by itself (users are reconnected within `BERTH_PROXY_ATTACH_INTERVAL`, 10 s by default). If you run Traefik some other way, point its file provider at the directory or the file and make sure it re-reads it: a file bind-mounted on its own keeps the old inode when it is replaced, and the running Traefik then never sees the new content.
+- Since Milestone 4 the backend stops workspaces nobody uses (30 minutes by default) and removes the containers of workspaces that stayed stopped for a week; read "What happens to a workspace nobody uses" below before upgrading a deployment with long-running sessions. Nobody is stopped until a full `BERTH_IDLE_TIMEOUT` after the new backend starts. The page now keeps sending heartbeats from a hidden tab, so rebuild (`--build`) to ship the new page together with the backend: an old page in a hidden tab would not count as in use. Set `BERTH_IDLE_TIMEOUT` and `BERTH_RECLAIM_AFTER` to something very long (`87600h`) to switch the reaper's stopping and removing off in effect.
 - A workspace container keeps the routing labels it was created with, so a change to the labels reaches an existing workspace only when its container is recreated (for one user: `docker rm -f berth-ws-<username>`; the data volume is untouched and the next power-on creates a fresh container with the same password and data). Changes to `traefik/dynamic.yml` (for example the `/ws` response headers below) need no such step, because the routers only name `berth-auth@file` and everything else lives in that file.
 
 ### Host requirements
@@ -67,6 +68,28 @@ curl -s -b jar -X POST -H 'Content-Type: application/json' localhost/api/workspa
 
 - **UDP ports and `BERTH_PUBLIC_IP`.** The remote browser's video is WebRTC. Each workspace publishes `BERTH_UDP_PORTS_PER_WORKSPACE` UDP ports (default 1: neko multiplexes every viewer of the workspace over one port; a larger block gives each viewer its own port, but closed tabs were seen to keep their port for 5-10 s and some stayed bound until neko restarted) from `BERTH_UDP_PORT_MIN`-`MAX` (default 30000-30999, so up to 1000 workspaces). Open that range in the firewall. **Set `BERTH_PUBLIC_IP` to the address browsers use to reach this host** (its LAN address on a LAN, its public address on the internet): it is required for every browser that is not on the Docker host itself, because without it neko offers only the workspace's private bridge address and the video never connects (the backend logs a warning at startup when it is empty). Every published port costs a `docker-proxy` process; beyond a few dozen users set `"userland-proxy": false` in `daemon.json`.
 - **The Docker socket.** The backend mounts `/var/run/docker.sock` to create containers, which is root-equivalent on the host. It runs unprivileged and joins the socket's group (`DOCKER_GID`).
+
+## What happens to a workspace nobody uses
+
+```
+running ──unused for BERTH_IDLE_TIMEOUT (30 min)──▶ stopped ──for BERTH_RECLAIM_AFTER (7 days)──▶ offline
+         docker stop: programs end,                  docker rm: the container goes,
+         container and files stay                    the data volume stays
+```
+
+A background job in the backend (the "reaper") looks at every workspace each `BERTH_REAPER_INTERVAL` (1 minute). A workspace counts as **in use** while
+
+- its web page is open: the page sends a heartbeat every 30 seconds, from a visible or a hidden tab (an open page holds open terminal and browser connections). A closed tab, a sleeping laptop or a lost connection stop the heartbeats; or
+- it is **busy**: its average CPU use since the reaper's previous look was at least `BERTH_IDLE_CPU_PERCENT` (5, in percent of one core), so a build or a long job is not killed. An idle workspace measures well under 1% (see CLAUDE.md, "Verified facts").
+
+Details that matter to an operator:
+
+- **A stop ends every process in the workspace**, including `nohup`/`tmux` jobs that sit idle (they are under the CPU threshold). Files in the home directory are untouched. The page says so when it shows "Power on".
+- A stop happens at the first look after the timeout, so the real idle time is the timeout plus up to one interval. After a backend restart (or a wall-clock jump, for example a resumed laptop) nobody is stopped for one full idle timeout, because the heartbeats of the downtime were missed. Timeouts below 5 minutes make the backend log a warning: they are for testing.
+- Power-on after a stop starts the kept container (seconds). Power-on after the container was removed creates a new one on the same volume: the same files and browser password, a slower start, and `/tmp` and anything else outside the home directory is gone.
+- **Data volumes are never deleted by Berth, so the volumes of abandoned accounts accumulate** until you remove them (there is no quota yet). After a removal the volume has no container, so do not run `docker volume prune -a` or `docker system prune -a --volumes` on the host; to prune anyway, keep Berth's volumes with `docker volume prune -a --filter 'label!=berth.managed'`.
+- A stopped workspace keeps its UDP port until its container is removed, so `BERTH_UDP_PORT_MIN`-`MAX` bounds the number of users active within `BERTH_RECLAIM_AFTER`, not only those running. Each user who has ever started a workspace keeps an empty private network `berth-net-<username>` (the address-pool setting above is the sizing answer).
+- The reaper also records what Docker did behind the backend's back (a crashed container is stopped, one removed by hand is offline and frees its port) and logs, once, any container carrying Berth's labels that the database does not know. It never removes those.
 
 ## How access is controlled
 
@@ -108,7 +131,10 @@ Without a build `GET /` answers `503 frontend not built` while the API keeps wor
 go vet ./... && go test ./...                          # unit tests, no Docker needed
 go test -tags integration ./internal/docker            # the Docker wrapper against a real daemon
 BERTH_TEST_TRAEFIK=/path/to/traefik go test -tags integration -run Traefik ./internal/workspace   # the /ws routes through a real Traefik
+scripts/e2e-reaper.sh                                  # the reaper on the real stack with 1-minute timeouts (about 12 minutes; deletes the stack's state)
 ```
+
+`scripts/e2e-reaper.sh` brings the stack up with an idle timeout and a reclaim age of one minute and a reaper that looks every 10 seconds, then checks on a real workspace container that a heartbeat keeps it up, that without one it is stopped (container kept) and later removed (the data volume kept, the files and the password back after the next power-on), that CPU load keeps it up, that a crash or a removal by hand is picked up on its own, and that nobody is stopped for one timeout after the backend restarts. `web/e2e/reaper.mjs` does the user's side with a real browser (see `web/README.md`).
 
 Build with `GOTOOLCHAIN=local` so Go never silently downloads a newer toolchain. `go.mod` requires Go 1.24 (the spec asks for 1.22+): that is the oldest release the security-fixed `golang.org/x/crypto` and a current SQLite (`modernc.org/sqlite`) support. The Docker image builds with a current Go release.
 

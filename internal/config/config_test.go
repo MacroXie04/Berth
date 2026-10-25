@@ -38,6 +38,11 @@ func TestDefaults(t *testing.T) {
 		StopTimeout:          15 * time.Second,
 		StartTimeout:         45 * time.Second,
 		ProxyAttachInterval:  10 * time.Second,
+
+		IdleTimeout:    30 * time.Minute,
+		ReclaimAfter:   7 * 24 * time.Hour,
+		ReaperInterval: time.Minute,
+		IdleCPUPercent: 5,
 	}
 	if cfg != want {
 		t.Fatalf("defaults:\n got %+v\nwant %+v", cfg, want)
@@ -211,6 +216,22 @@ func TestWorkspaceValuesAreValidated(t *testing.T) {
 		"start timeout not a time":  {"BERTH_START_TIMEOUT": "soon"},
 		"attach interval too short": {"BERTH_PROXY_ATTACH_INTERVAL": "500ms"},
 		"attach interval too long":  {"BERTH_PROXY_ATTACH_INTERVAL": "1h"},
+
+		"idle timeout under a minute":  {"BERTH_IDLE_TIMEOUT": "59s"},
+		"idle timeout zero":            {"BERTH_IDLE_TIMEOUT": "0s"},
+		"idle timeout negative":        {"BERTH_IDLE_TIMEOUT": "-30m"},
+		"idle timeout absurd":          {"BERTH_IDLE_TIMEOUT": "100000h"},
+		"idle timeout not a duration":  {"BERTH_IDLE_TIMEOUT": "30"},
+		"reclaim under a minute":       {"BERTH_RECLAIM_AFTER": "30s"},
+		"reclaim negative":             {"BERTH_RECLAIM_AFTER": "-1h"},
+		"reclaim absurd":               {"BERTH_RECLAIM_AFTER": "100000h"},
+		"reaper interval under 5s":     {"BERTH_REAPER_INTERVAL": "4s"},
+		"reaper interval over an hour": {"BERTH_REAPER_INTERVAL": "61m"},
+		"idle cpu negative":            {"BERTH_IDLE_CPU_PERCENT": "-1"},
+		"idle cpu NaN":                 {"BERTH_IDLE_CPU_PERCENT": "NaN"},
+		"idle cpu Inf":                 {"BERTH_IDLE_CPU_PERCENT": "Inf"},
+		"idle cpu over 1000":           {"BERTH_IDLE_CPU_PERCENT": "1001"},
+		"idle cpu not a number":        {"BERTH_IDLE_CPU_PERCENT": "five"},
 	}
 	for name, e := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -227,5 +248,34 @@ func TestWorkspaceValuesAreValidated(t *testing.T) {
 	}
 	if _, err := Load(env(ok)); err != nil {
 		t.Fatalf("boundary values rejected: %v", err)
+	}
+}
+
+func TestReaperSettings(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		"BERTH_IDLE_TIMEOUT":     "1m",
+		"BERTH_RECLAIM_AFTER":    "90s",
+		"BERTH_REAPER_INTERVAL":  "5s",
+		"BERTH_IDLE_CPU_PERCENT": "12.5",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IdleTimeout != time.Minute || cfg.ReclaimAfter != 90*time.Second || cfg.ReaperInterval != 5*time.Second ||
+		cfg.IdleCPUPercent != 12.5 {
+		t.Fatalf("reaper settings not applied: %+v", cfg)
+	}
+	// The limits themselves are accepted: an hour between looks, ten years of
+	// patience, the CPU check switched off or at its maximum.
+	for _, e := range []map[string]string{
+		{"BERTH_IDLE_TIMEOUT": "87600h", "BERTH_RECLAIM_AFTER": "87600h", "BERTH_REAPER_INTERVAL": "1h", "BERTH_IDLE_CPU_PERCENT": "0"},
+		{"BERTH_IDLE_CPU_PERCENT": "1000"},
+	} {
+		if _, err := Load(env(e)); err != nil {
+			t.Errorf("boundary values %v rejected: %v", e, err)
+		}
+	}
+	if cfg, err := Load(env(map[string]string{"BERTH_IDLE_CPU_PERCENT": "0"})); err != nil || cfg.IdleCPUPercent != 0 {
+		t.Fatalf("0 must disable the CPU check, not fall back to the default: %+v, %v", cfg, err)
 	}
 }

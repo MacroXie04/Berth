@@ -820,7 +820,7 @@ async function stub() {
     await ctx.close()
   })
 
-  await check('stub: polling, heartbeat cadence, hidden tab, idle stop and session expiry (fake clock)', async () => {
+  await check('stub: polling, heartbeat cadence, hidden tab, stop by the reaper and session expiry (fake clock)', async () => {
     const s = makeStub({ state: 'running', health: 'healthy' })
     const { ctx, page } = await newPage()
     await page.clock.install()
@@ -835,7 +835,8 @@ async function stub() {
     if (s.heartbeats !== h0 + 1) throw new Error(`heartbeats after 31 s: ${s.heartbeats - h0} (expected 1)`)
     if (polls() - p0 < 2 || polls() - p0 > 4) throw new Error(`status polls in 31 s: ${polls() - p0} (expected ~3 at 10 s)`)
 
-    // hidden tab: no heartbeats, no polls; visible again: both at once
+    // hidden tab: heartbeats go on (an open page is use), polling slows to once a
+    // minute; visible again: one poll at once and no extra heartbeat
     await page.evaluate(() => {
       Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' })
       document.dispatchEvent(new Event('visibilitychange'))
@@ -843,13 +844,18 @@ async function stub() {
     await sleep(100)
     const h1 = s.heartbeats
     const p1 = polls()
-    await tick(page, 60_000)
-    if (s.heartbeats !== h1 || polls() !== p1) throw new Error(`hidden tab still talks: ${s.heartbeats - h1} heartbeats, ${polls() - p1} polls`)
+    await tick(page, 61_000)
+    const beats = s.heartbeats - h1
+    const hiddenPolls = polls() - p1
+    if (beats < 1 || beats > 3) throw new Error(`a hidden tab sent ${beats} heartbeats in 61 s (expected 2, one per 30 s)`)
+    if (hiddenPolls < 1 || hiddenPolls > 2) throw new Error(`a hidden tab polled ${hiddenPolls} times in 61 s (expected 1, once a minute)`)
     await page.evaluate(() => {
       Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
       document.dispatchEvent(new Event('visibilitychange'))
     })
-    await waitFor(() => s.heartbeats === h1 + 1 && polls() === p1 + 1, { what: 'a heartbeat and a poll on becoming visible' })
+    await waitFor(() => polls() === p1 + hiddenPolls + 1, { what: 'a poll on becoming visible' })
+    await sleep(300)
+    if (s.heartbeats !== h1 + beats) throw new Error('becoming visible must not add a heartbeat')
 
     // the reaper stops it: the next poll notices, panes go, call to action returns, no more heartbeats
     s.state = 'stopped'

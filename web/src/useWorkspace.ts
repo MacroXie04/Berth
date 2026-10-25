@@ -18,7 +18,7 @@ export interface WorkspaceController {
   actionError: string | null
   /** The last status poll failed (network or server error), as readable text. */
   pollError: string | null
-  /** Tab is visible (polling and heartbeats pause while it is not). */
+  /** Tab is visible (a hidden tab polls slowly; its heartbeats continue). */
   visible: boolean
   powerOn(): void
   powerOff(): void
@@ -43,9 +43,12 @@ export interface Identity {
  *   then polls: every 2 s while starting, every 10 s while running, not at all
  *   while offline/stopped. One request at a time (a timer chain, not an
  *   interval): a status call on a running workspace takes about a second.
- *   While a request has failed it asks every 5 s, whatever the state.
+ *   While a request has failed it asks every 5 s, whatever the state. A hidden
+ *   tab asks every 60 s (see POLL_HIDDEN_MS).
  * - Sends POST /api/workspace/heartbeat every 30 s while the workspace is
- *   starting or running AND the tab is visible, and once when that becomes true.
+ *   starting or running, visible tab or not, and once when that becomes true:
+ *   the server powers a workspace off when nobody has used it for a while, and
+ *   an open page counts as use.
  * - Stale answers are dropped: one that was overtaken by a Power on/off
  *   (`epoch`), and one for which a newer status request was issued meanwhile
  *   (`refreshSeq`: a tab that becomes visible asks at once, even if the timer's
@@ -125,24 +128,28 @@ export function useWorkspace(api: Api, identity?: Identity): WorkspaceController
     return () => document.removeEventListener('visibilitychange', onChange)
   }, [])
 
-  // Fetch now: on mount, and again whenever the tab comes back.
+  // Fetch now: on mount (even in a background tab: it must know the state to
+  // heartbeat), and again whenever the tab comes back.
+  const mounted = useRef(false)
   useEffect(() => {
-    if (visible) void refresh()
+    const first = !mounted.current
+    mounted.current = true
+    if (visible || first) void refresh()
   }, [visible, refresh])
 
   // Next poll. `tick` changes after every finished request, which re-arms this.
   const state = status?.state ?? null
   const failing = pollError !== null
   useEffect(() => {
-    if (!visible || busy !== null) return
-    const delay = pollDelay(state, failing)
+    if (busy !== null) return
+    const delay = pollDelay(state, failing, visible)
     if (delay === null) return
     const t = setTimeout(() => void refresh(), delay)
     return () => clearTimeout(t)
   }, [tick, visible, busy, state, failing, refresh])
 
   // Heartbeat.
-  const beat = heartbeatActive(state, visible, busy)
+  const beat = heartbeatActive(state, busy)
   useEffect(() => {
     if (!beat) return
     const send = () => {

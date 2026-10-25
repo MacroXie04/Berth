@@ -134,27 +134,46 @@ describe('polling', () => {
     expect(m.workspace).toHaveBeenCalledTimes(1)
   })
 
-  it('does not poll while the tab is hidden, and refreshes at once when it returns', async () => {
+  it('a hidden tab polls once a minute, and refreshes at once when it returns', async () => {
     const m = mockApi(ws('running', 'healthy'))
     renderHook(() => useWorkspace(m.api))
     await advance(0)
     act(() => setVisibility('hidden'))
-    await advance(60_000)
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(1) // hiding the tab asks nothing
+    await advance(59_900)
     expect(m.workspace).toHaveBeenCalledTimes(1)
+    await advance(100)
+    expect(m.workspace).toHaveBeenCalledTimes(2) // not every 10 s: once a minute
+    await advance(60_000)
+    expect(m.workspace).toHaveBeenCalledTimes(3)
     act(() => setVisibility('visible'))
     await advance(0)
-    expect(m.workspace).toHaveBeenCalledTimes(2)
+    expect(m.workspace).toHaveBeenCalledTimes(4)
+    await advance(10_000)
+    expect(m.workspace).toHaveBeenCalledTimes(5) // the normal pace again
   })
 
-  it('does nothing at all when mounted in a hidden tab, until it becomes visible', async () => {
+  it('mounted in a hidden tab: asks once at once (it must know the state), then once a minute', async () => {
     visibility = 'hidden'
     const m = mockApi(ws('running', 'healthy'))
-    renderHook(() => useWorkspace(m.api))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(1)
+    expect(result.current.status?.state).toBe('running')
     await advance(60_000)
-    expect(m.workspace).not.toHaveBeenCalled()
-    expect(m.heartbeat).not.toHaveBeenCalled()
+    expect(m.workspace).toHaveBeenCalledTimes(2)
     act(() => setVisibility('visible'))
     await advance(0)
+    expect(m.workspace).toHaveBeenCalledTimes(3)
+  })
+
+  it('a hidden tab does not poll an offline or stopped workspace', async () => {
+    visibility = 'hidden'
+    const m = mockApi(ws('stopped'))
+    renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    await advance(300_000)
     expect(m.workspace).toHaveBeenCalledTimes(1)
   })
 
@@ -222,19 +241,58 @@ describe('heartbeat', () => {
     expect(m.heartbeat).not.toHaveBeenCalled()
   })
 
-  it('stops while the tab is hidden and resumes (with an immediate beat) when visible again', async () => {
+  it('keeps beating while the tab is hidden: an open page is use', async () => {
     const m = mockApi(ws('running', 'healthy'))
     renderHook(() => useWorkspace(m.api))
     await advance(0)
     expect(m.heartbeat).toHaveBeenCalledTimes(1)
     act(() => setVisibility('hidden'))
+    await advance(0)
+    expect(m.heartbeat).toHaveBeenCalledTimes(1) // hiding does not restart the cadence
     await advance(120_000)
-    expect(m.heartbeat).toHaveBeenCalledTimes(1)
+    expect(m.heartbeat).toHaveBeenCalledTimes(5) // every 30 s
     act(() => setVisibility('visible'))
     await advance(0)
-    expect(m.heartbeat).toHaveBeenCalledTimes(2)
+    expect(m.heartbeat).toHaveBeenCalledTimes(5) // coming back does not add a beat
     await advance(30_000)
-    expect(m.heartbeat).toHaveBeenCalledTimes(3)
+    expect(m.heartbeat).toHaveBeenCalledTimes(6)
+  })
+
+  it('a hidden tab beats from the start when it was opened in the background', async () => {
+    visibility = 'hidden'
+    const m = mockApi(ws('running', 'healthy'))
+    renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    expect(m.heartbeat).toHaveBeenCalledTimes(1)
+    await advance(30_000)
+    expect(m.heartbeat).toHaveBeenCalledTimes(2)
+  })
+
+  it('a hidden tab learns that the workspace was powered off and stops beating', async () => {
+    const m = mockApi(ws('running', 'healthy'))
+    const { result } = renderHook(() => useWorkspace(m.api))
+    await advance(0)
+    act(() => setVisibility('hidden'))
+    m.set(ws('stopped')) // the server's reaper (or an admin) powered it off
+    await advance(60_000) // the hidden tab's next poll
+    expect(result.current.status?.state).toBe('stopped')
+    const beats = m.heartbeat.mock.calls.length
+    await advance(120_000)
+    expect(m.heartbeat).toHaveBeenCalledTimes(beats) // no more beats for a workspace that is not up
+  })
+
+  it('a hidden tab of another account notices the change and stops', async () => {
+    const m = mockApi(ws('running', 'healthy', 'alice'))
+    const onMismatch = vi.fn()
+    renderHook(() => useWorkspace(m.api, { username: 'alice', onMismatch }))
+    await advance(0)
+    act(() => setVisibility('hidden'))
+    m.set(ws('running', 'healthy', 'bob')) // another tab logged in as bob; the cookie is shared
+    await advance(60_000)
+    expect(onMismatch).toHaveBeenCalledTimes(1)
+    const beats = m.heartbeat.mock.calls.length
+    await advance(120_000)
+    expect(m.heartbeat).toHaveBeenCalledTimes(beats) // alice's page no longer keeps bob's workspace up
   })
 
   it('stops on unmount', async () => {

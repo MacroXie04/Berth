@@ -363,6 +363,46 @@ func (m *Moby) ContainerStats(ctx context.Context, id string) (Stats, error) {
 	return statsFrom(s), nil
 }
 
+func (m *Moby) CPUUsage(ctx context.Context, id string) (CPUUsage, error) {
+	res, err := m.c.ContainerStats(ctx, id, client.ContainerStatsOptions{}) // one sample, no waiting
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return CPUUsage{}, fmt.Errorf("%w: container %s", ErrNotFound, id)
+		}
+		return CPUUsage{}, fmt.Errorf("docker: stats %s: %w", id, err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return CPUUsage{}, fmt.Errorf("docker: read stats %s: %w", id, err)
+	}
+	var s container.StatsResponse
+	if err := json.Unmarshal(body, &s); err != nil {
+		return CPUUsage{}, fmt.Errorf("docker: decode stats %s: %w", id, err)
+	}
+	return CPUUsage{TotalNanos: s.CPUStats.CPUUsage.TotalUsage, At: s.Read}, nil
+}
+
+func (m *Moby) ManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
+	res, err := m.c.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: client.Filters{}.Add("label", LabelManaged+"=true"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("docker: list containers: %w", err)
+	}
+	out := make([]ContainerInfo, 0, len(res.Items))
+	for _, c := range res.Items {
+		info := ContainerInfo{ID: c.ID, Status: string(c.State), Running: c.State == container.StateRunning, Labels: c.Labels}
+		if len(c.Names) > 0 {
+			info.Name = trimSlash(c.Names[0])
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 // statsFrom converts the daemon's raw sample, following the formulas of
 // `docker stats`: CPU from the delta against the previous sample, memory
 // without the reclaimable page cache.

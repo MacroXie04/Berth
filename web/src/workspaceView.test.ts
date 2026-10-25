@@ -3,6 +3,7 @@ import { ApiError } from './api'
 import type { Health, WorkspaceState, WorkspaceStatus } from './types'
 import {
   HEARTBEAT_MS,
+  POLL_HIDDEN_MS,
   POLL_RETRY_MS,
   POLL_RUNNING_MS,
   POLL_STARTING_MS,
@@ -112,15 +113,28 @@ describe('scheduling', () => {
     expect(pollDelay('stopped', false)).toBeNull()
     expect(pollDelay('running', false)).toBe(POLL_RUNNING_MS)
   })
-  it('heartbeats only while starting/running AND visible AND not powering off', () => {
+  it('heartbeats while starting/running and not powering off, visible tab or not', () => {
     expect(HEARTBEAT_MS).toBe(30_000)
-    expect(heartbeatActive('running', true, null)).toBe(true)
-    expect(heartbeatActive('starting', true, null)).toBe(true)
-    expect(heartbeatActive('running', false, null)).toBe(false)
-    expect(heartbeatActive('stopped', true, null)).toBe(false)
-    expect(heartbeatActive('offline', true, null)).toBe(false)
-    expect(heartbeatActive(null, true, null)).toBe(false)
-    expect(heartbeatActive('running', true, 'stopping')).toBe(false)
+    expect(heartbeatActive('running', null)).toBe(true)
+    expect(heartbeatActive('starting', null)).toBe(true)
+    expect(heartbeatActive('stopped', null)).toBe(false)
+    expect(heartbeatActive('offline', null)).toBe(false)
+    expect(heartbeatActive(null, null)).toBe(false)
+    expect(heartbeatActive('running', 'stopping')).toBe(false)
+    expect(heartbeatActive('running', 'starting')).toBe(true)
+  })
+  it('a hidden tab polls every minute, and not at all when there is nothing to watch', () => {
+    expect(POLL_HIDDEN_MS).toBe(60_000)
+    expect(pollDelay('running', false, false)).toBe(POLL_HIDDEN_MS)
+    expect(pollDelay('starting', false, false)).toBe(POLL_HIDDEN_MS)
+    expect(pollDelay(null, false, false)).toBe(POLL_HIDDEN_MS)
+    expect(pollDelay('stopped', false, false)).toBeNull()
+    expect(pollDelay('offline', false, false)).toBeNull()
+    // A failed request is retried, slowly.
+    expect(pollDelay('stopped', true, false)).toBe(POLL_HIDDEN_MS)
+    expect(pollDelay('running', true, false)).toBe(POLL_HIDDEN_MS)
+    // Visible stays as it was.
+    expect(pollDelay('running', false, true)).toBe(POLL_RUNNING_MS)
   })
   it('counts whole elapsed seconds', () => {
     expect(elapsedSeconds(1000, 4999)).toBe(3)
@@ -179,6 +193,7 @@ describe('ctaCopy', () => {
     const c = ctaCopy(ws('stopped'))
     expect(c.title).toBe('Your workspace is powered off')
     expect(c.text).toMatch(/^It was stopped, by you or after sitting idle\./)
+    expect(c.text).toMatch(/Programs that were running in it ended with it\./)
     expect(c.text).toMatch(/Your files are kept/)
   })
 

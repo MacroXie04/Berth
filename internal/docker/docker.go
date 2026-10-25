@@ -103,6 +103,20 @@ type Stats struct {
 	Pids          uint64
 }
 
+// CPUUsage is a cumulative reading of the CPU time a container has used. Two
+// readings give the average load between them, which is steadier than the
+// one-second `docker stats` sample: the image's own 5-second healthcheck alone
+// makes a one-second window read 4% now and then, and a minute-long average
+// barely shows it.
+type CPUUsage struct {
+	// TotalNanos is the CPU time used since the container started, summed over
+	// all cores. It restarts from zero when the container does.
+	TotalNanos uint64
+	// At is when the daemon took the reading (its clock, so the interval between
+	// two readings does not include our own scheduling delays).
+	At time.Time
+}
+
 // Client is the Docker surface Berth uses. Every method is safe to call
 // repeatedly; the "Ensure" and "Connect" ones are idempotent.
 type Client interface {
@@ -136,4 +150,10 @@ type Client interface {
 	// ContainerStats samples CPU and memory; it takes about a second because
 	// CPU needs two readings.
 	ContainerStats(ctx context.Context, id string) (Stats, error)
+	// CPUUsage takes one cumulative CPU reading without waiting for a second
+	// sample. ErrNotFound if the container does not exist.
+	CPUUsage(ctx context.Context, id string) (CPUUsage, error)
+	// ManagedContainers lists every container carrying the berth.managed label,
+	// running or not. Only ID, Name, Status, Running and Labels are filled in.
+	ManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 }

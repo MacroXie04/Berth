@@ -24,6 +24,7 @@ type Fake struct {
 	hooks      map[string]func(context.Context)
 	afterHooks map[string]func(context.Context)
 	stopWait   time.Duration // the timeout of the last StopContainer call
+	killed     int           // RemoveContainer calls that hit a running container
 	lostCreate []error       // CreateContainer calls that do their work, then fail
 
 	// StartHealth is the health a container reports right after it is started;
@@ -43,6 +44,11 @@ type fakeContainer struct {
 	info  ContainerInfo
 	spec  ContainerSpec
 	stats Stats
+
+	// CPU accounting: cpuNanos grows by cpuCores x elapsed fake time, up to cpuAt.
+	cpuNanos float64
+	cpuCores float64
+	cpuAt    time.Time
 }
 
 var _ Client = (*Fake)(nil)
@@ -215,6 +221,25 @@ func (f *Fake) SetStats(id string, s Stats) {
 	}
 }
 
+// SetCPUCores makes a container burn that many cores from now on (1 = one core
+// fully busy, 0.05 = 5% of one core). CPUUsage integrates it over the fake clock.
+func (f *Fake) SetCPUCores(id string, cores float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.containers[id]; c != nil {
+		c.advanceCPU(f.now())
+		c.cpuCores = cores
+	}
+}
+
+// advanceCPU accounts the CPU time used up to now at the current rate.
+func (c *fakeContainer) advanceCPU(now time.Time) {
+	if !c.cpuAt.IsZero() && now.After(c.cpuAt) && c.info.Running {
+		c.cpuNanos += c.cpuCores * float64(now.Sub(c.cpuAt))
+	}
+	c.cpuAt = now
+}
+
 // Spec returns the ContainerSpec a container was created with.
 func (f *Fake) Spec(id string) (ContainerSpec, bool) {
 	f.mu.Lock()
@@ -272,6 +297,7 @@ func (f *Fake) NetworkMembers(network string) []string {
 }
 
 func (c *fakeContainer) exit(at time.Time, code int) {
+	c.advanceCPU(at)
 	c.info.Running = false
 	c.info.Status = "exited"
 	c.info.ExitCode = code
@@ -423,6 +449,7 @@ func (f *Fake) StartContainer(ctx context.Context, id string) error {
 	}
 	c.info.Running = true
 	c.info.Status = "running"
+	c.cpuNanos, c.cpuAt = 0, f.now() // the daemon's counters start again with the container
 	c.info.StartedAt = f.now()
 	c.info.FinishedAt = time.Time{}
 	c.info.ExitCode = 0
@@ -462,8 +489,19 @@ func (f *Fake) RemoveContainer(ctx context.Context, id string) error {
 	if err := f.record("RemoveContainer " + id); err != nil {
 		return err
 	}
+	if c := f.containers[id]; c != nil && c.info.Running {
+		f.killed++
+	}
 	f.removeLocked(id)
 	return nil
+}
+
+// RemovedWhileRunning counts the containers that were force-removed while they
+// were running: a test that must never see one asserts it stays zero.
+func (f *Fake) RemovedWhileRunning() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.killed
 }
 
 func (f *Fake) InspectContainer(ctx context.Context, idOrName string) (ContainerInfo, error) {
@@ -502,6 +540,43 @@ func (f *Fake) ContainerStats(ctx context.Context, id string) (Stats, error) {
 		return Stats{}, fmt.Errorf("%w: container %s", ErrNotFound, id)
 	}
 	return c.stats, nil
+}
+
+func (f *Fake) CPUUsage(ctx context.Context, id string) (CPUUsage, error) {
+	f.runHook(ctx, "CPUUsage")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("CPUUsage " + id); err != nil {
+		return CPUUsage{}, err
+	}
+	c := f.containers[id]
+	if c == nil {
+		return CPUUsage{}, fmt.Errorf("%w: container %s", ErrNotFound, id)
+	}
+	now := f.now()
+	c.advanceCPU(now)
+	return CPUUsage{TotalNanos: uint64(c.cpuNanos), At: now}, nil
+}
+
+func (f *Fake) ManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
+	f.runHook(ctx, "ManagedContainers")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("ManagedContainers"); err != nil {
+		return nil, err
+	}
+	var out []ContainerInfo
+	for _, c := range f.containers {
+		if c.info.Labels[LabelManaged] != "true" {
+			continue
+		}
+		info := c.info
+		info.Labels = copyLabels(c.info.Labels)
+		info.Networks = nil
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func copyLabels(in map[string]string) map[string]string {

@@ -32,6 +32,18 @@ func newGate(f *docker.Fake, method string) *gate {
 	return g
 }
 
+// await waits until the gated call has been reached. If the operation under test
+// never gets there (a mutant that skips it, a bug), the test fails at once instead
+// of hanging until the package times out and hides every other failure.
+func (g *gate) await(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the operation never reached the gated Docker call")
+	}
+}
+
 // afterGate holds the first InspectContainer call AFTER it has its answer, so the
 // caller keeps an observation while the world moves on.
 func newAfterGate(f *docker.Fake) *gate {

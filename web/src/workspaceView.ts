@@ -6,6 +6,13 @@ export const POLL_RUNNING_MS = 10_000
 /** While the last status request failed, try again this often whatever the state. */
 export const POLL_RETRY_MS = 5000
 export const HEARTBEAT_MS = 30_000
+/**
+ * A hidden tab polls this often, whatever the state: it does not need the
+ * freshest numbers, but it must learn that its workspace was powered off (by the
+ * reaper, an admin, another tab) or that another account logged in, because it
+ * keeps sending heartbeats for as long as it believes the workspace is up.
+ */
+export const POLL_HIDDEN_MS = 60_000
 /** After this long in "starting" the page admits that it is slower than usual. */
 export const SLOW_START_SECONDS = 60
 
@@ -31,8 +38,11 @@ export type View =
  * POLL_RETRY_MS (faster states keep their own faster pace), offline and stopped
  * included: otherwise "Not up to date" would stay for ever next to a state
  * nobody polls any more.
+ *
+ * A hidden tab asks every POLL_HIDDEN_MS instead of the faster paces, and not at
+ * all for an offline or stopped workspace that is not failing.
  */
-export function pollDelay(state: WorkspaceState | null, failing = false): number | null {
+export function pollDelay(state: WorkspaceState | null, failing = false, visible = true): number | null {
   let base: number | null
   switch (state) {
     case null:
@@ -45,13 +55,19 @@ export function pollDelay(state: WorkspaceState | null, failing = false): number
     default:
       base = null
   }
+  if (!visible) return base === null && !failing ? null : POLL_HIDDEN_MS
   if (!failing) return base
   return base === null ? POLL_RETRY_MS : Math.min(base, POLL_RETRY_MS)
 }
 
-/** Whether the tab should be sending heartbeats. */
-export function heartbeatActive(state: WorkspaceState | null, visible: boolean, busy: Busy): boolean {
-  return visible && busy !== 'stopping' && (state === 'starting' || state === 'running')
+/**
+ * Whether the page should be sending heartbeats. It does not depend on whether
+ * the tab is visible: an open page holds open terminal and browser connections,
+ * and the server stops a workspace nobody has used for a while. A hidden tab
+ * counts as use; a closed one, a sleeping laptop and a lost connection do not.
+ */
+export function heartbeatActive(state: WorkspaceState | null, busy: Busy): boolean {
+  return busy !== 'stopping' && (state === 'starting' || state === 'running')
 }
 
 /**
@@ -150,8 +166,9 @@ export function ctaCopy(status: WorkspaceStatus): { title: string; text: string 
     return {
       title: 'Your workspace is powered off',
       text:
-        'It was stopped, by you or after sitting idle. Powering on starts it again in a few seconds. ' +
-        'Your files are kept: everything in your home directory is there when it comes back.',
+        'It was stopped, by you or after sitting idle. Programs that were running in it ended with it. ' +
+        'Your files are kept: everything in your home directory is there when it comes back. ' +
+        'Powering on starts it again in a few seconds.',
     }
   }
   const neverStarted = status.last_active_at === null && status.last_stopped_at === null

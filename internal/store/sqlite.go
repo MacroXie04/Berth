@@ -147,9 +147,14 @@ type rowScanner interface{ Scan(dest ...any) error }
 
 const userSelect = `SELECT id, username, password_hash, is_admin, created_at FROM users`
 
+// userDest lists the destinations of userSelect's columns, in order.
+func userDest(u *User) []any {
+	return []any{&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.CreatedAt}
+}
+
 func scanUser(r rowScanner) (User, error) {
 	var u User
-	if err := r.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.CreatedAt); err != nil {
+	if err := r.Scan(userDest(&u)...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
@@ -170,32 +175,81 @@ func (s *SQLite) UserByID(ctx context.Context, id int64) (User, error) {
 const workspaceSelect = `SELECT user_id, container_id, state, volume_name, mem_limit_mb, cpu_limit,
 	last_active_at, last_stopped_at, updated_at, udp_port_start, udp_port_end, neko_password FROM workspaces`
 
+// workspaceRow holds a workspace's columns as the driver returns them (NULLable
+// ones as sql.Null*), in the order of workspaceSelect.
+type workspaceRow struct {
+	w                       Workspace
+	containerID, nekoPW     sql.NullString
+	lastActive, lastStopped sql.NullTime
+	udpStart, udpEnd        sql.NullInt64
+}
+
+func (r *workspaceRow) dest() []any {
+	return []any{&r.w.UserID, &r.containerID, &r.w.State, &r.w.VolumeName, &r.w.MemLimitMB, &r.w.CPULimit,
+		&r.lastActive, &r.lastStopped, &r.w.UpdatedAt, &r.udpStart, &r.udpEnd, &r.nekoPW}
+}
+
+func (r *workspaceRow) workspace() Workspace {
+	w := r.w
+	w.ContainerID = r.containerID.String
+	w.NekoPassword = r.nekoPW.String
+	w.UDPPortStart, w.UDPPortEnd = int(r.udpStart.Int64), int(r.udpEnd.Int64) // NULL scans as 0
+	w.LastActiveAt = nullTime(r.lastActive)
+	w.LastStoppedAt = nullTime(r.lastStopped)
+	w.UpdatedAt = w.UpdatedAt.UTC()
+	return w
+}
+
 func scanWorkspace(r rowScanner) (Workspace, error) {
-	var (
-		w                       Workspace
-		containerID, nekoPW     sql.NullString
-		lastActive, lastStopped sql.NullTime
-		udpStart, udpEnd        sql.NullInt64
-	)
-	err := r.Scan(&w.UserID, &containerID, &w.State, &w.VolumeName, &w.MemLimitMB, &w.CPULimit,
-		&lastActive, &lastStopped, &w.UpdatedAt, &udpStart, &udpEnd, &nekoPW)
-	if err != nil {
+	var row workspaceRow
+	if err := r.Scan(row.dest()...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Workspace{}, ErrNotFound
 		}
 		return Workspace{}, fmt.Errorf("store: scan workspace: %w", err)
 	}
-	w.ContainerID = containerID.String
-	w.NekoPassword = nekoPW.String
-	w.UDPPortStart, w.UDPPortEnd = int(udpStart.Int64), int(udpEnd.Int64) // NULL scans as 0
-	w.LastActiveAt = nullTime(lastActive)
-	w.LastStoppedAt = nullTime(lastStopped)
-	w.UpdatedAt = w.UpdatedAt.UTC()
-	return w, nil
+	return row.workspace(), nil
+}
+
+func scanUserWorkspace(r rowScanner, uw *UserWorkspace) error {
+	var row workspaceRow
+	if err := r.Scan(append(userDest(&uw.User), row.dest()...)...); err != nil {
+		return fmt.Errorf("store: scan workspace: %w", err)
+	}
+	uw.User.CreatedAt = uw.User.CreatedAt.UTC()
+	uw.Workspace = row.workspace()
+	return nil
 }
 
 func (s *SQLite) WorkspaceByUserID(ctx context.Context, userID int64) (Workspace, error) {
 	return scanWorkspace(s.db.QueryRowContext(ctx, workspaceSelect+` WHERE user_id = ?`, userID))
+}
+
+func (s *SQLite) ListWorkspaces(ctx context.Context) ([]UserWorkspace, error) {
+	// One statement, so the user and workspace of a row are read together.
+	// The password hash and the neko password are not selected (their fields come
+	// back empty): a listing of everyone has no use for them, and a secret that is
+	// never loaded cannot end up in a log line or a response.
+	rows, err := s.db.QueryContext(ctx, `SELECT u.id, u.username, '', u.is_admin, u.created_at,
+		w.user_id, w.container_id, w.state, w.volume_name, w.mem_limit_mb, w.cpu_limit,
+		w.last_active_at, w.last_stopped_at, w.updated_at, w.udp_port_start, w.udp_port_end, NULL
+		FROM users u JOIN workspaces w ON w.user_id = u.id ORDER BY u.id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list workspaces: %w", err)
+	}
+	defer rows.Close()
+	var out []UserWorkspace
+	for rows.Next() {
+		var uw UserWorkspace
+		if err := scanUserWorkspace(rows, &uw); err != nil {
+			return nil, err
+		}
+		out = append(out, uw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list workspaces: %w", err)
+	}
+	return out, nil
 }
 
 func (s *SQLite) CreateSession(ctx context.Context, sess Session) error {

@@ -16,9 +16,9 @@ import (
 	"github.com/MacroXie04/Berth/internal/auth"
 	"github.com/MacroXie04/Berth/internal/config"
 	"github.com/MacroXie04/Berth/internal/docker"
+	"github.com/MacroXie04/Berth/internal/reaper"
 	"github.com/MacroXie04/Berth/internal/store"
 	"github.com/MacroXie04/Berth/internal/webui"
-	"github.com/MacroXie04/Berth/internal/workspace"
 )
 
 func main() {
@@ -71,7 +71,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	go keepProxyAttached(ctx, workspaces, log, cfg.ProxyAttachInterval)
+	if msg := shortIdleTimeoutWarning(cfg); msg != "" {
+		log.Warn(msg)
+	}
+	rp, err := reaper.New(st, workspaces, dock, reaperConfig(cfg), log, nil)
+	if err != nil {
+		return err
+	}
+	stopReaper := startReaper(ctx, rp, log)
+	defer stopReaper() // before dock.Close and st.Close: the reaper uses both
 
 	web, err := webui.Embedded()
 	if err != nil {
@@ -113,31 +121,25 @@ func run() error {
 	return nil
 }
 
-// keepProxyAttached reconnects Traefik to every user network at startup and then
-// periodically. Docker drops those attachments whenever the Traefik container is
-// recreated; without this every workspace would answer 504 until its owner
-// happened to restart it. A failure is logged when it first appears and again
-// when it clears, not every interval.
-func keepProxyAttached(ctx context.Context, m *workspace.Manager, log *slog.Logger, every time.Duration) {
-	var lastErr string
-	tick := time.NewTicker(every)
-	defer tick.Stop()
-	for {
-		attachCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := m.ReattachTraefik(attachCtx)
+// startReaper runs the reaper in the background and returns the function that
+// stops it: it cancels the reaper's context, which aborts the Docker call in
+// progress (every operation is safe to cut short: the database follows Docker on
+// the next pass), and waits a bounded time for it to finish, so the database is
+// not closed under a pass that is still writing to it. Eight seconds: Docker
+// Compose kills the container after ten.
+func startReaper(ctx context.Context, rp *reaper.Reaper, log *slog.Logger) (stop func()) {
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rp.Run(rctx)
+	}()
+	return func() {
 		cancel()
-		switch {
-		case err != nil && err.Error() != lastErr:
-			log.Warn("could not attach the proxy to user networks", "err", err)
-			lastErr = err.Error()
-		case err == nil && lastErr != "":
-			log.Info("proxy attached to all user networks again")
-			lastErr = ""
-		}
 		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
+		case <-done:
+		case <-time.After(8 * time.Second):
+			log.Warn("the reaper did not stop within 8 s; closing anyway")
 		}
 	}
 }

@@ -422,3 +422,66 @@ func TestTransitionOnlyIfContainer(t *testing.T) {
 		t.Fatalf("missing workspace: %v", err)
 	}
 }
+
+func TestListWorkspaces(t *testing.T) {
+	s := openTest(t)
+	if got, err := s.ListWorkspaces(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("empty store: %v, %v", got, err)
+	}
+	alice, bob := mustUser(t, s, "alice"), mustUser(t, s, "bob")
+
+	// Give bob's workspace a container, a port block, activity and a stop time, so
+	// every column of the join is checked against WorkspaceByUserID.
+	if _, err := s.TransitionWorkspace(ctx, bob.ID, []State{StateOffline}, StateStarting, t0, SetActiveAt(t0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AllocateUDPRange(ctx, bob.ID, 30000, 30007, 1, t0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, bob.ID, []State{StateStarting}, StateStarting, t0,
+		SetContainerID("c-bob"), SetNekoPassword("pw")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TransitionWorkspace(ctx, bob.ID, []State{StateStarting}, StateStopped, t0.Add(time.Hour),
+		SetStoppedAt(t0.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListWorkspaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].User.ID != alice.ID || got[1].User.ID != bob.ID {
+		t.Fatalf("rows = %+v, want alice then bob", got)
+	}
+	for _, uw := range got {
+		want, err := s.WorkspaceByUserID(ctx, uw.User.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want.NekoPassword = "" // secrets are not listed
+		if fmt.Sprintf("%+v", uw.Workspace) != fmt.Sprintf("%+v", want) {
+			t.Errorf("%s: listed workspace %+v differs from WorkspaceByUserID %+v", uw.User.Username, uw.Workspace, want)
+		}
+		wantUser, err := s.UserByID(ctx, uw.User.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantUser.PasswordHash = ""
+		if uw.User != wantUser {
+			t.Errorf("%s: listed user %+v differs from UserByID %+v", uw.User.Username, uw.User, wantUser)
+		}
+	}
+	if b := got[1]; b.User.Username != "bob" || b.Workspace.State != StateStopped || b.Workspace.ContainerID != "c-bob" ||
+		b.Workspace.UDPPortStart != 30000 || b.Workspace.LastStoppedAt == nil {
+		t.Errorf("bob = %+v", b)
+	}
+	for _, uw := range got {
+		if uw.User.PasswordHash != "" || uw.Workspace.NekoPassword != "" {
+			t.Errorf("%s: secrets were loaded: hash %q, neko password %q", uw.User.Username, uw.User.PasswordHash, uw.Workspace.NekoPassword)
+		}
+	}
+	if a := got[0]; a.Workspace.State != StateOffline || a.Workspace.ContainerID != "" || a.Workspace.LastActiveAt != nil {
+		t.Errorf("alice = %+v", a)
+	}
+}

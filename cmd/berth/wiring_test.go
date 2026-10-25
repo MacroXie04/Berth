@@ -8,11 +8,13 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MacroXie04/Berth/internal/config"
 	"github.com/MacroXie04/Berth/internal/docker"
+	"github.com/MacroXie04/Berth/internal/reaper"
 	"github.com/MacroXie04/Berth/internal/store"
 	"github.com/MacroXie04/Berth/internal/workspace"
 )
@@ -176,4 +178,172 @@ func TestNewWorkspaceManagerWiresTheSettingsIntoContainers(t *testing.T) {
 			t.Errorf("env:\n%s", strings.Join(r.env, "\n"))
 		}
 	})
+}
+
+// Every reaper setting reaches the reaper, under its own name.
+func TestReaperConfigCarriesEverySetting(t *testing.T) {
+	cfg := loadConfig(t, map[string]string{
+		"BERTH_IDLE_TIMEOUT":          "17m",
+		"BERTH_RECLAIM_AFTER":         "49h",
+		"BERTH_REAPER_INTERVAL":       "37s",
+		"BERTH_PROXY_ATTACH_INTERVAL": "7s",
+		"BERTH_IDLE_CPU_PERCENT":      "12.5",
+		"BERTH_STOP_TIMEOUT":          "21s",
+	})
+	got := reaperConfig(cfg)
+	want := reaper.Config{
+		IdleTimeout:    17 * time.Minute,
+		ReclaimAfter:   49 * time.Hour,
+		Interval:       37 * time.Second,
+		AttachInterval: 7 * time.Second,
+		IdleCPUPercent: 12.5,
+		OpTimeout:      21*time.Second + 2*time.Minute,
+	}
+	if got != want {
+		t.Errorf("reaperConfig:\n got %+v\nwant %+v", got, want)
+	}
+	if got.OpTimeout <= cfg.StopTimeout {
+		t.Errorf("OpTimeout %v must exceed the stop timeout %v, or a graceful stop is cut short", got.OpTimeout, cfg.StopTimeout)
+	}
+	// Concurrency is deliberately not configurable (the reaper's default applies);
+	// everything else must be set when every input is.
+	v := reflect.ValueOf(got)
+	for i := 0; i < v.NumField(); i++ {
+		if name := v.Type().Field(i).Name; name != "Concurrency" && v.Field(i).IsZero() {
+			t.Errorf("reaper.Config.%s is not set by reaperConfig", name)
+		}
+	}
+}
+
+// The defaults produce a configuration the reaper accepts.
+func TestReaperConfigFromTheDefaultsIsValid(t *testing.T) {
+	got := reaperConfig(loadConfig(t, nil))
+	if err := got.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got.IdleTimeout != 30*time.Minute || got.ReclaimAfter != 7*24*time.Hour || got.Interval != time.Minute || got.IdleCPUPercent != 5 {
+		t.Errorf("defaults: %+v", got)
+	}
+}
+
+func TestShortIdleTimeoutWarning(t *testing.T) {
+	for _, tc := range []struct {
+		timeout string
+		warn    bool
+	}{{"1m", true}, {"4m59s", true}, {"5m", false}, {"30m", false}} {
+		msg := shortIdleTimeoutWarning(loadConfig(t, map[string]string{"BERTH_IDLE_TIMEOUT": tc.timeout}))
+		if (msg != "") != tc.warn {
+			t.Errorf("BERTH_IDLE_TIMEOUT=%s: warning %q, want one: %v", tc.timeout, msg, tc.warn)
+		}
+		if tc.warn && !strings.Contains(msg, tc.timeout) {
+			t.Errorf("the warning should name the value: %q", msg)
+		}
+	}
+}
+
+// startReaper runs the reaper's loops and its stop function ends them: nothing is
+// left running to touch the database or Docker after the process closes them.
+func TestStartReaperRunsAndStopsTheLoops(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "berth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	dock := docker.NewFake(nil)
+	dock.AddContainer("berth-traefik")
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	m, err := newWorkspaceManager(loadConfig(t, nil), st, dock, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _, err := st.CreateUser(ctx, store.NewUser{
+		Username: "alice", PasswordHash: "x", VolumeName: workspace.VolumeName("alice"), MemLimitMB: 2048, CPULimit: 2,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := reaperConfig(loadConfig(t, nil))
+	cfg.AttachInterval, cfg.Interval = 5*time.Millisecond, 5*time.Millisecond // the loops, fast
+	rp, err := reaper.New(st, m, dock, cfg, log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := dock.CallCount("ConnectToNetwork")
+	stop := startReaper(ctx, rp, log)
+	deadline := time.Now().Add(5 * time.Second)
+	for dock.CallCount("ConnectToNetwork")-before < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := dock.CallCount("ConnectToNetwork") - before; n < 3 {
+		t.Fatalf("the attach loop ran %d times, want it repeated", n)
+	}
+	began := time.Now()
+	stop()
+	if took := time.Since(began); took > 2*time.Second {
+		t.Errorf("stop took %v", took)
+	}
+	n := dock.CallCount("ConnectToNetwork")
+	time.Sleep(60 * time.Millisecond)
+	if dock.CallCount("ConnectToNetwork") != n {
+		t.Error("the reaper kept running after stop returned")
+	}
+	stop() // idempotent: a second call must not hang or panic
+}
+
+// The point of stop(): the database and the Docker client are closed right after
+// it, so it must not return while a pass is still using them.
+func TestStopReaperWaitsForAPassThatIsStillRunning(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "berth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	dock := docker.NewFake(nil)
+	dock.AddContainer("berth-traefik")
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	m, err := newWorkspaceManager(loadConfig(t, nil), st, dock, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _, err := st.CreateUser(ctx, store.NewUser{
+		Username: "alice", PasswordHash: "x", VolumeName: workspace.VolumeName("alice"), MemLimitMB: 2048, CPULimit: 2,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+
+	var entered, finished atomic.Bool
+	dock.SetHook("InspectContainer", func(context.Context) {
+		if entered.CompareAndSwap(false, true) {
+			time.Sleep(300 * time.Millisecond) // a Docker call that does not return at once (hooks ignore the context)
+			finished.Store(true)
+		}
+	})
+	cfg := reaperConfig(loadConfig(t, nil))
+	cfg.Interval, cfg.AttachInterval = 5*time.Millisecond, time.Hour
+	rp, err := reaper.New(st, m, dock, cfg, log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := startReaper(ctx, rp, log)
+	deadline := time.Now().Add(5 * time.Second)
+	for !entered.Load() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !entered.Load() {
+		t.Fatal("the reaper never reached Docker")
+	}
+	stop()
+	if !finished.Load() {
+		t.Error("stop returned while the pass was still inside Docker: the database would be closed under it")
+	}
 }
